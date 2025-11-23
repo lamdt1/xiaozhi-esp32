@@ -95,8 +95,8 @@ void IRReceiver::Stop() {
     is_running_ = false;
 
     if (ir_learn_handle_ != nullptr) {
-        // Stop learning
-        ir_learn_stop(ir_learn_handle_);
+        // Stop learning (pass pointer to handle)
+        ir_learn_stop(&ir_learn_handle_);
     }
     
     ESP_LOGI(TAG, "IR Receiver stopped");
@@ -137,8 +137,9 @@ void IRReceiver::ProcessLearnedData(ir_learn_state_t state, uint8_t sub_step, st
                 raw_data_.clear();
                 
                 // Iterate through the linked list of IR timing data
-                struct ir_learn_sub_list_head *entry;
-                LIST_FOREACH(entry, data, list) {
+                // ir_learn uses SLIST (singly-linked list) structure
+                struct ir_learn_sub_list_t *entry;
+                SLIST_FOREACH(entry, data, next) {
                     // ir_learn provides timing data in microseconds
                     // Each entry contains mark and space durations
                     raw_data_.push_back(entry->mark);
