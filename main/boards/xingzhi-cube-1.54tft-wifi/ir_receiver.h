@@ -2,7 +2,7 @@
 #define __IR_RECEIVER_H__
 
 #include <driver/gpio.h>
-#include <driver/rmt_rx.h>
+#include <ir_learn.h>
 #include <functional>
 #include <vector>
 #include <string>
@@ -47,9 +47,7 @@ public:
 
 private:
     gpio_num_t gpio_num_;
-    rmt_channel_handle_t rmt_rx_channel_;
-    rmt_symbol_word_t* received_symbols_;
-    size_t received_symbol_num_;
+    ir_learn_handle_t ir_learn_handle_;
     bool is_running_;
     
     uint64_t last_command_;
@@ -59,17 +57,16 @@ private:
     CommandCallback command_callback_;
     RawDataCallback raw_data_callback_;
     
-    static bool rmt_rx_done_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t* edata, void* user_data);
-    void ProcessReceivedData(const rmt_symbol_word_t* symbols, size_t symbol_num);
+    static void ir_learn_callback(ir_learn_state_t state, uint8_t sub_step, 
+                                   struct ir_learn_sub_list_head *data, void *user_data);
+    void ProcessLearnedData(ir_learn_state_t state, struct ir_learn_sub_list_head *data);
     
-    // Protocol decoders
-    bool DecodeNEC(const rmt_symbol_word_t* symbols, size_t symbol_num, uint64_t& command);
-    bool DecodeRC5(const rmt_symbol_word_t* symbols, size_t symbol_num, uint64_t& command);
-    bool DecodeSony(const rmt_symbol_word_t* symbols, size_t symbol_num, uint64_t& command);
-    bool DecodeRaw(const rmt_symbol_word_t* symbols, size_t symbol_num);
+    // Protocol decoders (for compatibility, but ir_learn provides raw data)
+    bool DecodeNEC(const std::vector<uint32_t>& raw_data, uint64_t& command);
+    bool DecodeRC5(const std::vector<uint32_t>& raw_data, uint64_t& command);
+    bool DecodeSony(const std::vector<uint32_t>& raw_data, uint64_t& command);
     
     // Helper functions
-    uint32_t GetSymbolDuration(const rmt_symbol_word_t& symbol);
     bool IsDurationInRange(uint32_t duration, uint32_t expected, uint32_t tolerance);
 };
 
