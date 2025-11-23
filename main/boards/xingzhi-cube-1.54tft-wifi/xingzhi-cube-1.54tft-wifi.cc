@@ -301,13 +301,19 @@ private:
                         }
                         
                         // Only show notification if receiver is still valid and not shutting down
-                        if (board->ir_receiver_ != nullptr) {
-                            std::string message = std::string(Lang::Strings::IR_LEARNED) + protocol + " 0x";
-                            char hex_str[19];
-                            snprintf(hex_str, sizeof(hex_str), "%016" PRIX64, command);
-                            message += hex_str;
-                            board->GetDisplay()->ShowNotification(message);
-                            ESP_LOGI(TAG, "IR Command learned: %s - 0x%016" PRIX64, protocol.c_str(), command);
+                        // Cache pointers to avoid TOCTOU race condition
+                        IRReceiver* ir_receiver = board->ir_receiver_;
+                        if (ir_receiver != nullptr && !board->shutting_down_.load(std::memory_order_acquire)) {
+                            // Cache display pointer to avoid TOCTOU
+                            Display* display = board->GetDisplay();
+                            if (display != nullptr && !board->shutting_down_.load(std::memory_order_acquire)) {
+                                std::string message = std::string(Lang::Strings::IR_LEARNED) + protocol + " 0x";
+                                char hex_str[19];
+                                snprintf(hex_str, sizeof(hex_str), "%016" PRIX64, command);
+                                message += hex_str;
+                                display->ShowNotification(message);
+                                ESP_LOGI(TAG, "IR Command learned: %s - 0x%016" PRIX64, protocol.c_str(), command);
+                            }
                         }
                     }
                 }
@@ -373,18 +379,26 @@ private:
                     CircularStrip* circular_strip = dynamic_cast<CircularStrip*>(led);
                     
                     if (single_led != nullptr) {
+                        ESP_LOGI(TAG, "Disabling SingleLed to free RMT channels...");
                         single_led->Disable();
                         led_was_enabled = true;
-                        ESP_LOGI(TAG, "Disabled SingleLed to free RMT channels");
+                        ESP_LOGI(TAG, "SingleLed disabled successfully");
                     } else if (circular_strip != nullptr) {
+                        ESP_LOGI(TAG, "Disabling CircularStrip to free RMT channels...");
                         circular_strip->Disable();
                         led_was_enabled = true;
-                        ESP_LOGI(TAG, "Disabled CircularStrip to free RMT channels");
+                        ESP_LOGI(TAG, "CircularStrip disabled successfully");
+                    } else {
+                        ESP_LOGI(TAG, "LED is not a SingleLed or CircularStrip, skipping disable");
                     }
+                } else {
+                    ESP_LOGI(TAG, "No LED found, skipping LED disable");
                 }
                 
-                // Small delay to allow RMT channels to be fully released
-                vTaskDelay(pdMS_TO_TICKS(100));
+                // Longer delay to allow RMT channels to be fully released after LED deletion
+                // RMT driver needs time to clean up internal state
+                ESP_LOGI(TAG, "Waiting for RMT channels to be released...");
+                vTaskDelay(pdMS_TO_TICKS(300));  // Increased delay for RMT cleanup
                 
                 // Ensure IR receiver is stopped and cleaned up before starting
                 // This helps free any RMT channels it might be holding
@@ -405,6 +419,29 @@ private:
                 if (!ir_receiver_->IsRunning()) {
                     ESP_LOGE(TAG, "Failed to start IR Receiver after retry");
                     ir_learning_active_.store(false, std::memory_order_release);
+                    
+                    // Re-enable LED before returning on error
+                    if (led_was_enabled) {
+                        Led* led = GetLed();
+                        if (led != nullptr) {
+                            SingleLed* single_led = dynamic_cast<SingleLed*>(led);
+                            CircularStrip* circular_strip = dynamic_cast<CircularStrip*>(led);
+                            
+                            if (single_led != nullptr) {
+                                ESP_LOGI(TAG, "Re-enabling SingleLed after IR receiver start failure...");
+                                single_led->Enable();
+                                ESP_LOGI(TAG, "SingleLed re-enabled successfully");
+                            } else if (circular_strip != nullptr) {
+                                ESP_LOGI(TAG, "Re-enabling CircularStrip after IR receiver start failure...");
+                                circular_strip->Enable();
+                                ESP_LOGI(TAG, "CircularStrip re-enabled successfully");
+                            }
+                            
+                            // Restore LED state
+                            led->OnStateChanged();
+                        }
+                    }
+                    
                     cJSON* json = cJSON_CreateObject();
                     cJSON_AddBoolToObject(json, "success", false);
                     cJSON_AddStringToObject(json, "error", "Failed to start IR receiver - no free RMT channels. Try disabling LED or other RMT devices.");
@@ -418,6 +455,29 @@ private:
                     // Stop IR receiver before returning to prevent resource leak
                     ir_receiver_->Stop();
                     ir_learning_active_.store(false, std::memory_order_release);
+                    
+                    // Re-enable LED before returning on error
+                    if (led_was_enabled) {
+                        Led* led = GetLed();
+                        if (led != nullptr) {
+                            SingleLed* single_led = dynamic_cast<SingleLed*>(led);
+                            CircularStrip* circular_strip = dynamic_cast<CircularStrip*>(led);
+                            
+                            if (single_led != nullptr) {
+                                ESP_LOGI(TAG, "Re-enabling SingleLed after semaphore check failure...");
+                                single_led->Enable();
+                                ESP_LOGI(TAG, "SingleLed re-enabled successfully");
+                            } else if (circular_strip != nullptr) {
+                                ESP_LOGI(TAG, "Re-enabling CircularStrip after semaphore check failure...");
+                                circular_strip->Enable();
+                                ESP_LOGI(TAG, "CircularStrip re-enabled successfully");
+                            }
+                            
+                            // Restore LED state
+                            led->OnStateChanged();
+                        }
+                    }
+                    
                     cJSON* json = cJSON_CreateObject();
                     cJSON_AddBoolToObject(json, "success", false);
                     cJSON_AddStringToObject(json, "error", "IR learning system not properly initialized");

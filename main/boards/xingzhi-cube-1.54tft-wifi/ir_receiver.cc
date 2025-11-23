@@ -95,19 +95,25 @@ void IRReceiver::Start() {
         ESP_LOGW(TAG, "Cleaning up existing RMT channel before starting");
         Stop();
         // Additional delay to ensure RMT channel is fully released
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
     
-    // If channel still exists after cleanup, delete it to free resources
+    // If channel still exists after cleanup, force delete it to free resources
     if (rmt_rx_channel_ != nullptr) {
         ESP_LOGW(TAG, "Force deleting RMT channel to free resources");
+        // Disable first if not already disabled
+        rmt_disable(rmt_rx_channel_);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
         esp_err_t ret = rmt_del_channel(rmt_rx_channel_);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to delete RMT channel: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "RMT channel deleted successfully");
         }
         rmt_rx_channel_ = nullptr;
-        // Additional delay after deletion
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // Additional delay after deletion to allow RMT driver to fully release resources
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     // Configure RMT receiver

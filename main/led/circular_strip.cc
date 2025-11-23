@@ -1,6 +1,7 @@
 #include "circular_strip.h"
 #include "application.h"
 #include <esp_log.h>
+#include <memory>
 
 #define TAG "CircularStrip"
 
@@ -106,23 +107,31 @@ void CircularStrip::FadeOut(int interval_ms) {
 }
 
 void CircularStrip::Breathe(StripColor low, StripColor high, int interval_ms) {
-    StartStripTask(interval_ms, [this, low, high]() {
-        static int direction = 1;
-        static int brightness = low_brightness_;
+    // Use shared_ptr to avoid memory leaks and state pollution
+    // These will be automatically cleaned up when the lambda is destroyed
+    std::shared_ptr<int> direction = std::make_shared<int>(1);
+    std::shared_ptr<int> brightness = std::make_shared<int>(low_brightness_);
+    
+    StartStripTask(interval_ms, [this, low, high, direction, brightness]() {
+        // Note: mutex is already held by the timer callback wrapper (line 30)
+        // No need to lock again here to avoid deadlock
+        if (led_strip_ == nullptr) {
+            return;  // LED strip disabled, shared_ptr will auto-cleanup
+        }
         
-        brightness += direction * 2;
-        if (brightness >= default_brightness_) {
-            brightness = default_brightness_;
-            direction = -1;
-        } else if (brightness <= low_brightness_) {
-            brightness = low_brightness_;
-            direction = 1;
+        *brightness += *direction * 2;
+        if (*brightness >= default_brightness_) {
+            *brightness = default_brightness_;
+            *direction = -1;
+        } else if (*brightness <= low_brightness_) {
+            *brightness = low_brightness_;
+            *direction = 1;
         }
         
         for (int i = 0; i < max_leds_; i++) {
-            uint8_t r = (high.red * brightness) / default_brightness_;
-            uint8_t g = (high.green * brightness) / default_brightness_;
-            uint8_t b = (high.blue * brightness) / default_brightness_;
+            uint8_t r = (high.red * (*brightness)) / default_brightness_;
+            uint8_t g = (high.green * (*brightness)) / default_brightness_;
+            uint8_t b = (high.blue * (*brightness)) / default_brightness_;
             led_strip_set_pixel(led_strip_, i, r, g, b);
         }
         led_strip_refresh(led_strip_);
@@ -130,15 +139,29 @@ void CircularStrip::Breathe(StripColor low, StripColor high, int interval_ms) {
 }
 
 void CircularStrip::Scroll(StripColor low, StripColor high, int length, int interval_ms) {
-    StartStripTask(interval_ms, [this, low, high, length]() {
-        static int position = 0;
+    // Validate length to prevent division by zero
+    if (length <= 0) {
+        ESP_LOGW(TAG, "Scroll called with invalid length (%d), using default length 1", length);
+        length = 1;
+    }
+    
+    // Use shared_ptr to avoid memory leaks and state pollution
+    std::shared_ptr<int> position = std::make_shared<int>(0);
+    
+    StartStripTask(interval_ms, [this, low, high, length, position]() {
+        // Note: mutex is already held by the timer callback wrapper (line 30)
+        // No need to lock again here to avoid deadlock
+        if (led_strip_ == nullptr) {
+            return;  // LED strip disabled, shared_ptr will auto-cleanup
+        }
         
         for (int i = 0; i < max_leds_; i++) {
-            int distance = abs(i - position);
+            int distance = abs(i - *position);
             if (distance > length) {
                 distance = length;
             }
             
+            // length is guaranteed to be > 0 due to validation above
             uint8_t r = low.red + ((high.red - low.red) * (length - distance)) / length;
             uint8_t g = low.green + ((high.green - low.green) * (length - distance)) / length;
             uint8_t b = low.blue + ((high.blue - low.blue) * (length - distance)) / length;
@@ -147,9 +170,9 @@ void CircularStrip::Scroll(StripColor low, StripColor high, int length, int inte
         }
         led_strip_refresh(led_strip_);
         
-        position++;
-        if (position >= max_leds_ + length) {
-            position = 0;
+        (*position)++;
+        if (*position >= max_leds_ + length) {
+            *position = 0;
         }
     });
 }
