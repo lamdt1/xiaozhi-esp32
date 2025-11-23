@@ -45,6 +45,7 @@ private:
     QueueHandle_t ir_command_queue_ = nullptr;  // Queue to defer callback from ISR
     TaskHandle_t ir_learn_task_handle_ = nullptr;  // Task handle for cleanup
     std::atomic<bool> ir_learning_active_{false};  // Atomic to prevent data race between ISR and task context
+    std::atomic<bool> shutting_down_{false};  // Flag to signal task that board is being destroyed
     uint64_t learned_command_ = 0;
     std::string learned_protocol_ = "";
     std::vector<uint32_t> learned_raw_data_;
@@ -120,7 +121,7 @@ private:
         boot_button_.OnLongPress([this]() {
             power_save_timer_->WakeUp();
             ESP_LOGI(TAG, "Boot button long pressed (3s), entering WiFi configuration mode");
-            GetDisplay()->ShowNotification("Đang vào chế độ cấu hình WiFi...");
+            GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
             ResetWifiConfiguration();
         });
 
@@ -200,6 +201,8 @@ private:
         ir_command_queue_ = xQueueCreate(5, sizeof(IRCommandEvent));
         if (ir_command_queue_ == nullptr) {
             ESP_LOGE(TAG, "Failed to create IR command queue");
+            // Cannot proceed without queue - IR learning will not work
+            return;
         }
         
         // Set callback for decoded commands (only for learning mode via MCP tool)
@@ -240,11 +243,24 @@ private:
         });
         
         // Create task to process IR commands from queue
-        xTaskCreate([](void* param) {
+        // Only create task if queue was successfully created
+        BaseType_t task_result = xTaskCreate([](void* param) {
             XINGZHI_CUBE_1_54TFT_WIFI* board = static_cast<XINGZHI_CUBE_1_54TFT_WIFI*>(param);
             IRCommandEvent event;
             
             while (true) {
+                // Check if board is being destroyed - exit immediately if so
+                if (board->shutting_down_.load(std::memory_order_acquire)) {
+                    ESP_LOGI(TAG, "IR learn task exiting due to shutdown flag");
+                    break;
+                }
+                
+                // Defensive check: ensure queue is valid before using it
+                if (board->ir_command_queue_ == nullptr) {
+                    ESP_LOGE(TAG, "IR command queue is null in task, exiting");
+                    break;
+                }
+                
                 BaseType_t result = xQueueReceive(board->ir_command_queue_, &event, portMAX_DELAY);
                 
                 // If queue was deleted while waiting, xQueueReceive returns pdFALSE
@@ -253,42 +269,61 @@ private:
                     break;  // Queue deleted or invalid, exit task gracefully
                 }
                 
+                // Check shutdown flag again after receiving event (destructor may have run)
+                if (board->shutting_down_.load(std::memory_order_acquire)) {
+                    ESP_LOGI(TAG, "IR learn task exiting due to shutdown flag after event");
+                    break;
+                }
+                
                 if (board->ir_learning_active_.load(std::memory_order_acquire)) {
                     // Process in task context (safe for display, semaphore, and memory operations)
-                    board->learned_command_ = event.command;
-                    board->learned_protocol_ = std::string(event.protocol);
+                    // Copy event data to local variables first to minimize access to board members
+                    uint64_t command = event.command;
+                    std::string protocol(event.protocol);
                     
                     // Fetch raw data now (in task context, safe to copy vector)
                     // Check if ir_receiver_ is still valid (may be deleted by destructor)
-                    if (board->ir_receiver_ != nullptr) {
-                        board->learned_raw_data_ = board->ir_receiver_->GetRawData();
-                    } else {
-                        // IR receiver was deleted, clear raw data
-                        board->learned_raw_data_.clear();
+                    std::vector<uint32_t> raw_data;
+                    if (board->ir_receiver_ != nullptr && !board->shutting_down_.load(std::memory_order_acquire)) {
+                        raw_data = board->ir_receiver_->GetRawData();
                     }
                     
-                    board->ir_learning_active_.store(false, std::memory_order_release);
-                    
-                    if (board->ir_learn_semaphore_ != nullptr) {
-                        xSemaphoreGive(board->ir_learn_semaphore_);
-                    }
-                    
-                    // Only show notification if receiver is still valid
-                    if (board->ir_receiver_ != nullptr) {
-                        std::string message = "Đã học: " + board->learned_protocol_ + " 0x";
-                        char hex_str[19];
-                        snprintf(hex_str, sizeof(hex_str), "%016" PRIX64, event.command);
-                        message += hex_str;
-                        board->GetDisplay()->ShowNotification(message);
-                        ESP_LOGI(TAG, "IR Command learned: %s - 0x%016" PRIX64, board->learned_protocol_.c_str(), event.command);
+                    // Only update board state if not shutting down
+                    if (!board->shutting_down_.load(std::memory_order_acquire)) {
+                        board->learned_command_ = command;
+                        board->learned_protocol_ = protocol;
+                        board->learned_raw_data_ = raw_data;
+                        board->ir_learning_active_.store(false, std::memory_order_release);
+                        
+                        if (board->ir_learn_semaphore_ != nullptr) {
+                            xSemaphoreGive(board->ir_learn_semaphore_);
+                        }
+                        
+                        // Only show notification if receiver is still valid and not shutting down
+                        if (board->ir_receiver_ != nullptr) {
+                            std::string message = std::string(Lang::Strings::IR_LEARNED) + protocol + " 0x";
+                            char hex_str[19];
+                            snprintf(hex_str, sizeof(hex_str), "%016" PRIX64, command);
+                            message += hex_str;
+                            board->GetDisplay()->ShowNotification(message);
+                            ESP_LOGI(TAG, "IR Command learned: %s - 0x%016" PRIX64, protocol.c_str(), command);
+                        }
                     }
                 }
             }
             
-            // Task exits gracefully when queue is deleted
+            // Task exits gracefully when queue is deleted or shutdown flag is set
             ESP_LOGI(TAG, "IR learn task exiting");
             vTaskDelete(nullptr);  // Delete self
         }, "ir_learn_task", 4096, this, 5, &ir_learn_task_handle_);
+        
+        if (task_result != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create IR learning task");
+            // Clean up queue if task creation failed
+            vQueueDelete(ir_command_queue_);
+            ir_command_queue_ = nullptr;
+            return;
+        }
         
         ESP_LOGI(TAG, "IR Receiver initialized on GPIO %d", IR_RECEIVER_GPIO);
     }
@@ -325,13 +360,13 @@ private:
                 learned_raw_data_.clear();
                 ir_learning_active_.store(true, std::memory_order_release);
                 
-                // Enable IR receiver - ensure it's stopped first to avoid channel conflicts
-                if (ir_receiver_->IsRunning()) {
-                    ESP_LOGW(TAG, "IR Receiver already running, stopping first");
-                    ir_receiver_->Stop();
-                    vTaskDelay(pdMS_TO_TICKS(100)); // Small delay to ensure cleanup
-                }
+                // Temporarily disable LED to free RMT channels for IR learning
+                // LED uses RMT TX channels which share resources with RMT RX
+                Led* led = GetLed();
+                bool led_was_enabled = (led != nullptr);
                 
+                // Enable IR receiver - reuse existing channel if available
+                // No need to stop first if channel exists - Start() will handle reuse
                 ir_receiver_->Start();
                 if (!ir_receiver_->IsRunning()) {
                     ESP_LOGE(TAG, "Failed to start IR Receiver");
@@ -346,13 +381,16 @@ private:
                 // Check if semaphore is available
                 if (ir_learn_semaphore_ == nullptr) {
                     ESP_LOGE(TAG, "IR learn semaphore not available");
+                    // Stop IR receiver before returning to prevent resource leak
+                    ir_receiver_->Stop();
+                    ir_learning_active_.store(false, std::memory_order_release);
                     cJSON* json = cJSON_CreateObject();
                     cJSON_AddBoolToObject(json, "success", false);
                     cJSON_AddStringToObject(json, "error", "IR learning system not properly initialized");
                     return json;
                 }
                 
-                GetDisplay()->ShowNotification("Đang chờ lệnh IR...");
+                GetDisplay()->ShowNotification(Lang::Strings::IR_WAITING_FOR_COMMAND);
                 ESP_LOGI(TAG, "Waiting for IR command (timeout: %d seconds)", timeout_seconds);
                 
                 // Wait for IR command with timeout
@@ -373,7 +411,17 @@ private:
                 }
                 
                 // Stop IR receiver after learning attempt (success or timeout)
+                // Channel is kept for reuse, not deleted
                 ir_receiver_->Stop();
+                
+                // Re-enable LED after IR learning completes
+                // LED state will be restored by OnStateChanged() if needed
+                if (led_was_enabled) {
+                    Led* led = GetLed();
+                    if (led != nullptr) {
+                        led->OnStateChanged();
+                    }
+                }
                 
                 if (result == pdTRUE) {
                     // Successfully received a command
@@ -400,7 +448,7 @@ private:
                 } else {
                     // Timeout
                     ir_learning_active_.store(false, std::memory_order_release);
-                    GetDisplay()->ShowNotification("Hết thời gian chờ");
+                    GetDisplay()->ShowNotification(Lang::Strings::IR_TIMEOUT);
                     ESP_LOGW(TAG, "IR learning timeout after %d seconds", timeout_seconds);
                     
                     cJSON* json = cJSON_CreateObject();
@@ -429,35 +477,52 @@ public:
     }
 
     ~XINGZHI_CUBE_1_54TFT_WIFI() {
-        // Step 1: Stop IR receiver first to prevent new callbacks from accessing resources
+        // Step 1: Set shutdown flag to signal task to stop accessing board members
+        // This must be done first to prevent use-after-free
+        shutting_down_.store(true, std::memory_order_release);
+        
+        // Step 2: Stop IR receiver to prevent new callbacks from accessing resources
         if (ir_receiver_ != nullptr) {
             ir_receiver_->Stop();
             delete ir_receiver_;
             ir_receiver_ = nullptr;  // Set to null immediately after deletion
         }
 
-        // Step 2: Delete queue to unblock the task waiting on xQueueReceive
+        // Step 3: Delete queue to unblock the task waiting on xQueueReceive
         // This allows the task to exit gracefully instead of being forcefully terminated
-        // Note: ir_receiver_ is already null, so task can safely check for null before accessing it
+        // Note: ir_receiver_ is already null and shutting_down_ is set, so task can safely check before accessing
         if (ir_command_queue_ != nullptr) {
             vQueueDelete(ir_command_queue_);
             ir_command_queue_ = nullptr;
         }
 
-        // Step 3: Give the task time to exit naturally after queue deletion
-        // The task will see xQueueReceive fail and exit its loop
+        // Step 4: Wait for task to exit naturally after queue deletion and shutdown flag
+        // The task will see xQueueReceive fail or shutdown flag and exit its loop
         if (ir_learn_task_handle_ != nullptr) {
-            // Wait up to 100ms for task to exit naturally
-            vTaskDelay(pdMS_TO_TICKS(100));
+            // Wait for task to actually exit (poll with timeout)
+            const int max_wait_ms = 500;  // Maximum wait time
+            const int poll_interval_ms = 10;  // Check every 10ms
+            int waited_ms = 0;
             
-            // If task still exists, delete it (shouldn't happen if queue deletion worked)
-            if (eTaskGetState(ir_learn_task_handle_) != eDeleted) {
+            while (waited_ms < max_wait_ms) {
+                eTaskState task_state = eTaskGetState(ir_learn_task_handle_);
+                if (task_state == eDeleted || task_state == eInvalid) {
+                    break;  // Task has exited
+                }
+                vTaskDelay(pdMS_TO_TICKS(poll_interval_ms));
+                waited_ms += poll_interval_ms;
+            }
+            
+            // If task still exists after waiting, force delete it
+            eTaskState task_state = eTaskGetState(ir_learn_task_handle_);
+            if (task_state != eDeleted && task_state != eInvalid) {
+                ESP_LOGW(TAG, "IR learn task did not exit naturally, forcing deletion");
                 vTaskDelete(ir_learn_task_handle_);
             }
             ir_learn_task_handle_ = nullptr;
         }
 
-        // Step 4: Delete semaphore last (no dependencies)
+        // Step 5: Delete semaphore last (no dependencies)
         if (ir_learn_semaphore_ != nullptr) {
             vSemaphoreDelete(ir_learn_semaphore_);
             ir_learn_semaphore_ = nullptr;

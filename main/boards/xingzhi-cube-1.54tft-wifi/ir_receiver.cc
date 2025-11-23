@@ -41,6 +41,16 @@ IRReceiver::IRReceiver(gpio_num_t gpio_num)
 
 IRReceiver::~IRReceiver() {
     Stop();
+    
+    // Delete RMT channel in destructor to free resources permanently
+    if (rmt_rx_channel_ != nullptr) {
+        esp_err_t ret = rmt_del_channel(rmt_rx_channel_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to delete RMT channel in destructor: %s", esp_err_to_name(ret));
+        }
+        rmt_rx_channel_ = nullptr;
+    }
+    
     if (received_symbols_) {
         free(received_symbols_);
         received_symbols_ = nullptr;
@@ -48,6 +58,33 @@ IRReceiver::~IRReceiver() {
 }
 
 void IRReceiver::Start() {
+    // Reuse existing channel if available and not running
+    if (rmt_rx_channel_ != nullptr && !is_running_) {
+        // Channel exists but not running - just restart receive
+        rmt_receive_config_t receive_cfg = {
+            .signal_range_min_ns = RMT_RX_FILTER_THRESHOLD * 1000,
+            .signal_range_max_ns = 0x7FFFFFFF,
+        };
+        
+        esp_err_t ret = rmt_enable(rmt_rx_channel_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to enable existing RMT channel: %s", esp_err_to_name(ret));
+            return;
+        }
+        
+        ret = rmt_receive(rmt_rx_channel_, received_symbols_, 
+                         sizeof(rmt_symbol_word_t) * 1024, &receive_cfg);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start RMT receive on existing channel: %s", esp_err_to_name(ret));
+            rmt_disable(rmt_rx_channel_);
+            return;
+        }
+        
+        is_running_ = true;
+        ESP_LOGI(TAG, "IR Receiver restarted on existing channel (GPIO %d)", gpio_num_);
+        return;
+    }
+    
     if (is_running_ && rmt_rx_channel_ != nullptr) {
         ESP_LOGW(TAG, "IR Receiver already running");
         return;
@@ -140,7 +177,7 @@ void IRReceiver::Stop() {
     is_running_ = false;
 
     if (rmt_rx_channel_) {
-        // Disable channel first
+        // Disable channel first (but don't delete - reuse it next time)
         esp_err_t ret = rmt_disable(rmt_rx_channel_);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to disable RMT channel: %s", esp_err_to_name(ret));
@@ -149,16 +186,11 @@ void IRReceiver::Stop() {
         // Small delay to ensure any pending callback operations complete
         vTaskDelay(pdMS_TO_TICKS(10));
         
-        // Delete channel to free the RMT resource
-        ret = rmt_del_channel(rmt_rx_channel_);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to delete RMT channel: %s (0x%x)", esp_err_to_name(ret), ret);
-            // Even if deletion fails, clear the pointer to prevent reuse
-        }
-        rmt_rx_channel_ = nullptr;
+        // Note: We keep the channel handle to reuse it next time
+        // Only delete in destructor to free resources permanently
     }
     
-    ESP_LOGI(TAG, "IR Receiver stopped");
+    ESP_LOGI(TAG, "IR Receiver stopped (channel kept for reuse)");
 }
 
 void IRReceiver::OnCommandReceived(CommandCallback callback) {

@@ -51,6 +51,9 @@
         "LOADING_ASSETS": "Đang tải tài nguyên...",
         "PLEASE_WAIT": "Vui lòng đợi...",
         "FOUND_NEW_ASSETS": "Tìm thấy tài nguyên mới: %s",
-        "HELLO_MY_FRIEND": "Xin chào, bạn của tôi!"
+        "HELLO_MY_FRIEND": "Xin chào, bạn của tôi!",
+        "IR_WAITING_FOR_COMMAND": "Đang chờ lệnh IR...",
+        "IR_LEARNED": "Đã học: ",
+        "IR_TIMEOUT": "Hết thời gian chờ"
     }
 }
