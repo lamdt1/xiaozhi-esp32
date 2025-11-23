@@ -11,7 +11,7 @@
 #define BLINK_INFINITE -1
 
 
-SingleLed::SingleLed(gpio_num_t gpio) {
+SingleLed::SingleLed(gpio_num_t gpio) : gpio_num_(gpio) {
     // If the gpio is not connected, you should use NoLed class
     assert(gpio != GPIO_NUM_NC);
 
@@ -159,5 +159,44 @@ void SingleLed::OnStateChanged() {
         default:
             ESP_LOGW(TAG, "Unknown led strip event: %d", device_state);
             return;
+    }
+}
+
+void SingleLed::Disable() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (led_strip_ != nullptr) {
+        esp_timer_stop(blink_timer_);
+        led_strip_del(led_strip_);
+        led_strip_ = nullptr;
+        ESP_LOGI(TAG, "LED strip disabled (RMT channel freed)");
+    }
+}
+
+void SingleLed::Enable() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (led_strip_ == nullptr) {
+        led_strip_config_t strip_config = {};
+        strip_config.strip_gpio_num = gpio_num_;
+        strip_config.max_leds = 1;
+        strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+        strip_config.led_model = LED_MODEL_WS2812;
+
+        led_strip_rmt_config_t rmt_config = {};
+        rmt_config.resolution_hz = 10 * 1000 * 1000; // 10MHz
+
+        esp_err_t ret = led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to recreate LED strip: %s", esp_err_to_name(ret));
+            return;
+        }
+        led_strip_clear(led_strip_);
+        
+        // Restore color if set
+        if (r_ != 0 || g_ != 0 || b_ != 0) {
+            led_strip_set_pixel(led_strip_, 0, r_, g_, b_);
+            led_strip_refresh(led_strip_);
+        }
+        
+        ESP_LOGI(TAG, "LED strip re-enabled");
     }
 }

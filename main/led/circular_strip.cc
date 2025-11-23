@@ -6,7 +6,7 @@
 
 #define BLINK_INFINITE -1
 
-CircularStrip::CircularStrip(gpio_num_t gpio, uint8_t max_leds) : max_leds_(max_leds) {
+CircularStrip::CircularStrip(gpio_num_t gpio, uint8_t max_leds) : gpio_num_(gpio), max_leds_(max_leds) {
     // If the gpio is not connected, you should use NoLed class
     assert(gpio != GPIO_NUM_NC);
 
@@ -107,79 +107,109 @@ void CircularStrip::FadeOut(int interval_ms) {
 
 void CircularStrip::Breathe(StripColor low, StripColor high, int interval_ms) {
     StartStripTask(interval_ms, [this, low, high]() {
-        static bool increase = true;
-        static StripColor color = low;
-        if (increase) {
-            if (color.red < high.red) {
-                color.red++;
-            }
-            if (color.green < high.green) {
-                color.green++;
-            }
-            if (color.blue < high.blue) {
-                color.blue++;
-            }
-            if (color.red == high.red && color.green == high.green && color.blue == high.blue) {
-                increase = false;
-            }
-        } else {
-            if (color.red > low.red) {
-                color.red--;
-            }
-            if (color.green > low.green) {
-                color.green--;
-            }
-            if (color.blue > low.blue) {
-                color.blue--;
-            }
-            if (color.red == low.red && color.green == low.green && color.blue == low.blue) {
-                increase = true;
-            }
+        static int direction = 1;
+        static int brightness = low_brightness_;
+        
+        brightness += direction * 2;
+        if (brightness >= default_brightness_) {
+            brightness = default_brightness_;
+            direction = -1;
+        } else if (brightness <= low_brightness_) {
+            brightness = low_brightness_;
+            direction = 1;
         }
+        
         for (int i = 0; i < max_leds_; i++) {
-            led_strip_set_pixel(led_strip_, i, color.red, color.green, color.blue);
+            uint8_t r = (high.red * brightness) / default_brightness_;
+            uint8_t g = (high.green * brightness) / default_brightness_;
+            uint8_t b = (high.blue * brightness) / default_brightness_;
+            led_strip_set_pixel(led_strip_, i, r, g, b);
         }
         led_strip_refresh(led_strip_);
     });
 }
 
 void CircularStrip::Scroll(StripColor low, StripColor high, int length, int interval_ms) {
-    for (int i = 0; i < max_leds_; i++) {
-        colors_[i] = low;
-    }
     StartStripTask(interval_ms, [this, low, high, length]() {
-        static int offset = 0;
+        static int position = 0;
+        
         for (int i = 0; i < max_leds_; i++) {
-            colors_[i] = low;
-        }
-        for (int j = 0; j < length; j++) {
-            int i = (offset + j) % max_leds_;
-            colors_[i] = high;
-        }
-        for (int i = 0; i < max_leds_; i++) {
-            led_strip_set_pixel(led_strip_, i, colors_[i].red, colors_[i].green, colors_[i].blue);
+            int distance = abs(i - position);
+            if (distance > length) {
+                distance = length;
+            }
+            
+            uint8_t r = low.red + ((high.red - low.red) * (length - distance)) / length;
+            uint8_t g = low.green + ((high.green - low.green) * (length - distance)) / length;
+            uint8_t b = low.blue + ((high.blue - low.blue) * (length - distance)) / length;
+            
+            led_strip_set_pixel(led_strip_, i, r, g, b);
         }
         led_strip_refresh(led_strip_);
-        offset = (offset + 1) % max_leds_;
+        
+        position++;
+        if (position >= max_leds_ + length) {
+            position = 0;
+        }
     });
+}
+
+void CircularStrip::SetBrightness(uint8_t default_brightness, uint8_t low_brightness) {
+    default_brightness_ = default_brightness;
+    low_brightness_ = low_brightness;
 }
 
 void CircularStrip::StartStripTask(int interval_ms, std::function<void()> cb) {
     if (led_strip_ == nullptr) {
         return;
     }
-
+    
     std::lock_guard<std::mutex> lock(mutex_);
     esp_timer_stop(strip_timer_);
-    
     strip_callback_ = cb;
     esp_timer_start_periodic(strip_timer_, interval_ms * 1000);
 }
 
-void CircularStrip::SetBrightness(uint8_t default_brightness, uint8_t low_brightness) {
-    default_brightness_ = default_brightness;
-    low_brightness_ = low_brightness;
-    OnStateChanged();
+void CircularStrip::Rainbow(StripColor low, StripColor high, int interval_ms) {
+    StartStripTask(interval_ms, [this, low, high]() {
+        static int hue = 0;
+        
+        for (int i = 0; i < max_leds_; i++) {
+            int led_hue = (hue + (i * 360 / max_leds_)) % 360;
+            
+            uint8_t r, g, b;
+            if (led_hue < 60) {
+                r = 255;
+                g = (led_hue * 255) / 60;
+                b = 0;
+            } else if (led_hue < 120) {
+                r = ((120 - led_hue) * 255) / 60;
+                g = 255;
+                b = 0;
+            } else if (led_hue < 180) {
+                r = 0;
+                g = 255;
+                b = ((led_hue - 120) * 255) / 60;
+            } else if (led_hue < 240) {
+                r = 0;
+                g = ((240 - led_hue) * 255) / 60;
+                b = 255;
+            } else if (led_hue < 300) {
+                r = ((led_hue - 240) * 255) / 60;
+                g = 0;
+                b = 255;
+            } else {
+                r = 255;
+                g = 0;
+                b = ((360 - led_hue) * 255) / 60;
+            }
+            
+            led_strip_set_pixel(led_strip_, i, r, g, b);
+        }
+        led_strip_refresh(led_strip_);
+        
+        hue = (hue + 5) % 360;
+    });
 }
 
 void CircularStrip::OnStateChanged() {
@@ -187,9 +217,8 @@ void CircularStrip::OnStateChanged() {
     auto device_state = app.GetDeviceState();
     switch (device_state) {
         case kDeviceStateStarting: {
-            StripColor low = { 0, 0, 0 };
-            StripColor high = { low_brightness_, low_brightness_, default_brightness_ };
-            Scroll(low, high, 3, 100);
+            StripColor color = { low_brightness_, low_brightness_, default_brightness_ };
+            Blink(color, 100);
             break;
         }
         case kDeviceStateWifiConfiguring: {
@@ -197,9 +226,11 @@ void CircularStrip::OnStateChanged() {
             Blink(color, 500);
             break;
         }
-        case kDeviceStateIdle:
-            FadeOut(50);
+        case kDeviceStateIdle: {
+            StripColor color = { 0, 0, 0 };
+            SetAllColor(color);
             break;
+        }
         case kDeviceStateConnecting: {
             StripColor color = { low_brightness_, low_brightness_, default_brightness_ };
             SetAllColor(color);
@@ -207,8 +238,13 @@ void CircularStrip::OnStateChanged() {
         }
         case kDeviceStateListening:
         case kDeviceStateAudioTesting: {
-            StripColor color = { default_brightness_, low_brightness_, low_brightness_ };
-            SetAllColor(color);
+            if (app.IsVoiceDetected()) {
+                StripColor color = { default_brightness_, low_brightness_, low_brightness_ };
+                SetAllColor(color);
+            } else {
+                StripColor color = { low_brightness_, low_brightness_, low_brightness_ };
+                SetAllColor(color);
+            }
             break;
         }
         case kDeviceStateSpeaking: {
@@ -229,5 +265,46 @@ void CircularStrip::OnStateChanged() {
         default:
             ESP_LOGW(TAG, "Unknown led strip event: %d", device_state);
             return;
+    }
+}
+
+void CircularStrip::Disable() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (led_strip_ != nullptr) {
+        esp_timer_stop(strip_timer_);
+        led_strip_del(led_strip_);
+        led_strip_ = nullptr;
+        ESP_LOGI(TAG, "LED strip disabled (RMT channel freed)");
+    }
+}
+
+void CircularStrip::Enable() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (led_strip_ == nullptr) {
+        led_strip_config_t strip_config = {};
+        strip_config.strip_gpio_num = gpio_num_;
+        strip_config.max_leds = max_leds_;
+        strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+        strip_config.led_model = LED_MODEL_WS2812;
+
+        led_strip_rmt_config_t rmt_config = {};
+        rmt_config.resolution_hz = 10 * 1000 * 1000; // 10MHz
+
+        esp_err_t ret = led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to recreate LED strip: %s", esp_err_to_name(ret));
+            return;
+        }
+        led_strip_clear(led_strip_);
+        
+        // Restore colors if set
+        for (int i = 0; i < max_leds_; i++) {
+            if (colors_[i].red != 0 || colors_[i].green != 0 || colors_[i].blue != 0) {
+                led_strip_set_pixel(led_strip_, i, colors_[i].red, colors_[i].green, colors_[i].blue);
+            }
+        }
+        led_strip_refresh(led_strip_);
+        
+        ESP_LOGI(TAG, "LED strip re-enabled");
     }
 }

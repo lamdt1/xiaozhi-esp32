@@ -14,11 +14,18 @@ public:
     virtual ~SingleLed();
 
     void OnStateChanged() override;
+    
+    // Temporarily disable LED strip to free RMT channels
+    void Disable();
+    
+    // Re-enable LED strip after being disabled
+    void Enable();
 
 private:
     std::mutex mutex_;
     TaskHandle_t blink_task_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;
+    gpio_num_t gpio_num_;  // Store GPIO for recreation
     uint8_t r_ = 0, g_ = 0, b_ = 0;
     int blink_counter_ = 0;
     int blink_interval_ms_ = 0;

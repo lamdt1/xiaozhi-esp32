@@ -28,11 +28,18 @@ public:
     void Blink(StripColor color, int interval_ms);
     void Breathe(StripColor low, StripColor high, int interval_ms);
     void Scroll(StripColor low, StripColor high, int length, int interval_ms);
+    
+    // Temporarily disable LED strip to free RMT channels
+    void Disable();
+    
+    // Re-enable LED strip after being disabled
+    void Enable();
 
 private:
     std::mutex mutex_;
     TaskHandle_t blink_task_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;
+    gpio_num_t gpio_num_;  // Store GPIO for recreation
     int max_leds_ = 0;
     std::vector<StripColor> colors_;
     int blink_counter_ = 0;

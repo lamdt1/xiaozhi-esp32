@@ -7,6 +7,7 @@
 #include "config.h"
 #include "power_save_timer.h"
 #include "led/single_led.h"
+#include "led/circular_strip.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
 #include "ir_receiver.h"
@@ -360,20 +361,53 @@ private:
                 learned_raw_data_.clear();
                 ir_learning_active_.store(true, std::memory_order_release);
                 
-                // Temporarily disable LED to free RMT channels for IR learning
+                // Temporarily disable LED strips to free RMT channels for IR learning
                 // LED uses RMT TX channels which share resources with RMT RX
                 Led* led = GetLed();
-                bool led_was_enabled = (led != nullptr);
+                bool led_was_enabled = false;
+                
+                // Disable LED strip if it's a SingleLed or CircularStrip to free RMT channels
+                if (led != nullptr) {
+                    // Try to cast to SingleLed or CircularStrip and disable
+                    SingleLed* single_led = dynamic_cast<SingleLed*>(led);
+                    CircularStrip* circular_strip = dynamic_cast<CircularStrip*>(led);
+                    
+                    if (single_led != nullptr) {
+                        single_led->Disable();
+                        led_was_enabled = true;
+                        ESP_LOGI(TAG, "Disabled SingleLed to free RMT channels");
+                    } else if (circular_strip != nullptr) {
+                        circular_strip->Disable();
+                        led_was_enabled = true;
+                        ESP_LOGI(TAG, "Disabled CircularStrip to free RMT channels");
+                    }
+                }
+                
+                // Small delay to allow RMT channels to be fully released
+                vTaskDelay(pdMS_TO_TICKS(100));
+                
+                // Ensure IR receiver is stopped and cleaned up before starting
+                // This helps free any RMT channels it might be holding
+                ir_receiver_->Stop();
+                vTaskDelay(pdMS_TO_TICKS(100));  // Allow time for RMT channel release
                 
                 // Enable IR receiver - reuse existing channel if available
-                // No need to stop first if channel exists - Start() will handle reuse
+                // Start() will handle channel reuse or creation
                 ir_receiver_->Start();
+                
+                // Retry with delay if first attempt fails (allows time for other RMT channels to release)
                 if (!ir_receiver_->IsRunning()) {
-                    ESP_LOGE(TAG, "Failed to start IR Receiver");
+                    ESP_LOGW(TAG, "First IR receiver start attempt failed, retrying after delay...");
+                    vTaskDelay(pdMS_TO_TICKS(200));  // Wait longer for RMT channels to be released
+                    ir_receiver_->Start();
+                }
+                
+                if (!ir_receiver_->IsRunning()) {
+                    ESP_LOGE(TAG, "Failed to start IR Receiver after retry");
                     ir_learning_active_.store(false, std::memory_order_release);
                     cJSON* json = cJSON_CreateObject();
                     cJSON_AddBoolToObject(json, "success", false);
-                    cJSON_AddStringToObject(json, "error", "Failed to start IR receiver - no free RMT channels");
+                    cJSON_AddStringToObject(json, "error", "Failed to start IR receiver - no free RMT channels. Try disabling LED or other RMT devices.");
                     return json;
                 }
                 ESP_LOGI(TAG, "IR Receiver started for learning");
@@ -414,11 +448,22 @@ private:
                 // Channel is kept for reuse, not deleted
                 ir_receiver_->Stop();
                 
-                // Re-enable LED after IR learning completes
-                // LED state will be restored by OnStateChanged() if needed
+                // Re-enable LED strips after IR learning completes
                 if (led_was_enabled) {
                     Led* led = GetLed();
                     if (led != nullptr) {
+                        SingleLed* single_led = dynamic_cast<SingleLed*>(led);
+                        CircularStrip* circular_strip = dynamic_cast<CircularStrip*>(led);
+                        
+                        if (single_led != nullptr) {
+                            single_led->Enable();
+                            ESP_LOGI(TAG, "Re-enabled SingleLed");
+                        } else if (circular_strip != nullptr) {
+                            circular_strip->Enable();
+                            ESP_LOGI(TAG, "Re-enabled CircularStrip");
+                        }
+                        
+                        // Restore LED state
                         led->OnStateChanged();
                     }
                 }
