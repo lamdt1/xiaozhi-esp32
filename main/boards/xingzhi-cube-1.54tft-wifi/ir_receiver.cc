@@ -2,6 +2,8 @@
 #include <esp_log.h>
 #include <cinttypes>
 #include <algorithm>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "IRReceiver"
 #define RMT_CLK_DIV 80  // 80MHz / 80 = 1MHz, 1 tick = 1us
@@ -46,15 +48,17 @@ IRReceiver::~IRReceiver() {
 }
 
 void IRReceiver::Start() {
-    if (is_running_) {
+    if (is_running_ && rmt_rx_channel_ != nullptr) {
         ESP_LOGW(TAG, "IR Receiver already running");
         return;
     }
 
-    // Ensure any previous channel is cleaned up
-    if (rmt_rx_channel_ != nullptr) {
+    // Ensure any previous channel is fully cleaned up
+    if (rmt_rx_channel_ != nullptr || is_running_) {
         ESP_LOGW(TAG, "Cleaning up existing RMT channel before starting");
         Stop();
+        // Additional delay to ensure RMT channel is fully released
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     // Configure RMT receiver
@@ -132,21 +136,28 @@ void IRReceiver::Stop() {
         return;
     }
 
+    // Mark as stopped first to prevent callback from restarting receive
+    is_running_ = false;
+
     if (rmt_rx_channel_) {
-        // Disable and delete channel
+        // Disable channel first
         esp_err_t ret = rmt_disable(rmt_rx_channel_);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to disable RMT channel: %s", esp_err_to_name(ret));
         }
         
+        // Small delay to ensure any pending callback operations complete
+        vTaskDelay(pdMS_TO_TICKS(10));
+        
+        // Delete channel to free the RMT resource
         ret = rmt_del_channel(rmt_rx_channel_);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to delete RMT channel: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to delete RMT channel: %s (0x%x)", esp_err_to_name(ret), ret);
+            // Even if deletion fails, clear the pointer to prevent reuse
         }
         rmt_rx_channel_ = nullptr;
     }
     
-    is_running_ = false;
     ESP_LOGI(TAG, "IR Receiver stopped");
 }
 
@@ -164,15 +175,23 @@ void IRReceiver::Process() {
 
 bool IRReceiver::rmt_rx_done_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t* edata, void* user_data) {
     IRReceiver* receiver = static_cast<IRReceiver*>(user_data);
-    if (receiver && edata) {
+    if (receiver && edata && receiver->is_running_ && receiver->rmt_rx_channel_ != nullptr) {
         receiver->ProcessReceivedData(edata->received_symbols, edata->num_symbols);
-        // Restart receiving
-        rmt_receive_config_t receive_cfg = {
-            .signal_range_min_ns = RMT_RX_FILTER_THRESHOLD * 1000,
-            .signal_range_max_ns = 0x7FFFFFFF,
-        };
-        rmt_receive(receiver->rmt_rx_channel_, receiver->received_symbols_, 
-                    sizeof(rmt_symbol_word_t) * 1024, &receive_cfg);
+        
+        // Restart receiving only if receiver is still running
+        // Check again after processing (receiver might have been stopped)
+        if (receiver->is_running_ && receiver->rmt_rx_channel_ != nullptr) {
+            rmt_receive_config_t receive_cfg = {
+                .signal_range_min_ns = RMT_RX_FILTER_THRESHOLD * 1000,
+                .signal_range_max_ns = 0x7FFFFFFF,
+            };
+            esp_err_t ret = rmt_receive(receiver->rmt_rx_channel_, receiver->received_symbols_, 
+                        sizeof(rmt_symbol_word_t) * 1024, &receive_cfg);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to restart RMT receive in callback: %s", esp_err_to_name(ret));
+                receiver->is_running_ = false;  // Mark as stopped if restart fails
+            }
+        }
     }
     return false; // Return false to indicate we don't want to free the buffer
 }
