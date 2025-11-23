@@ -121,10 +121,10 @@ void IRReceiver::ir_learn_callback(ir_learn_state_t state, uint8_t sub_step,
         return;
     }
     
-    receiver->ProcessLearnedData(state, data);
+    receiver->ProcessLearnedData(state, sub_step, data);
 }
 
-void IRReceiver::ProcessLearnedData(ir_learn_state_t state, struct ir_learn_sub_list_head *data) {
+void IRReceiver::ProcessLearnedData(ir_learn_state_t state, uint8_t sub_step, struct ir_learn_sub_list_head *data) {
     switch (state) {
         case IR_LEARN_STATE_READY:
             ESP_LOGI(TAG, "IR Learn ready");

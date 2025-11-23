@@ -59,7 +59,7 @@ private:
     
     static void ir_learn_callback(ir_learn_state_t state, uint8_t sub_step, 
                                    struct ir_learn_sub_list_head *data, void *user_data);
-    void ProcessLearnedData(ir_learn_state_t state, struct ir_learn_sub_list_head *data);
+    void ProcessLearnedData(ir_learn_state_t state, uint8_t sub_step, struct ir_learn_sub_list_head *data);
     
     // Protocol decoders (for compatibility, but ir_learn provides raw data)
     bool DecodeNEC(const std::vector<uint32_t>& raw_data, uint64_t& command);

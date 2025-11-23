@@ -110,7 +110,9 @@ void CircularStrip::Breathe(StripColor low, StripColor high, int interval_ms) {
     // Use shared_ptr to avoid memory leaks and state pollution
     // These will be automatically cleaned up when the lambda is destroyed
     std::shared_ptr<int> direction = std::make_shared<int>(1);
-    std::shared_ptr<int> brightness = std::make_shared<int>(low_brightness_);
+    // Initialize brightness to low_brightness_ - 2 so that after first increment
+    // it becomes low_brightness_, ensuring the animation starts at the low value
+    std::shared_ptr<int> brightness = std::make_shared<int>(low_brightness_ - 2);
     
     StartStripTask(interval_ms, [this, low, high, direction, brightness]() {
         // Note: mutex is already held by the timer callback wrapper (line 30)
@@ -180,6 +182,8 @@ void CircularStrip::Scroll(StripColor low, StripColor high, int length, int inte
 void CircularStrip::SetBrightness(uint8_t default_brightness, uint8_t low_brightness) {
     default_brightness_ = default_brightness;
     low_brightness_ = low_brightness;
+    // Trigger state update to apply new brightness values to current LED state
+    OnStateChanged();
 }
 
 void CircularStrip::StartStripTask(int interval_ms, std::function<void()> cb) {
