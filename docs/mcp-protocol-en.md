@@ -268,3 +268,10 @@ sequenceDiagram
 
 This document outlines the main interaction flow of the MCP protocol in this project. For specific parameter details and tool functionality, please refer to `McpServer::AddCommonTools` in `main/mcp_server.cc` and the implementation of each tool.
 
+
+
+
+
+
+
+

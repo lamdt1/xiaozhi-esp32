@@ -494,3 +494,10 @@ This protocol completes functions including audio stream upload, TTS audio playb
 
 The server and device need to agree in advance on the field meanings, timing logic, and error handling rules for various messages to ensure smooth communication. The above information can serve as a basic document for subsequent integration, development, or extension.
 
+
+
+
+
+
+
+

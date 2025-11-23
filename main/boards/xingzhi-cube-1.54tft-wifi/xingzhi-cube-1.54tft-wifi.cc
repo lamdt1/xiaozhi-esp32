@@ -9,13 +9,21 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "ir_receiver.h"
+#include "mcp_server.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <wifi_station.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <cJSON.h>
+#include <cinttypes>
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
 
@@ -27,8 +35,24 @@ private:
     SpiLcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
+    IRReceiver* ir_receiver_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
+    
+    // IR learning state
+    SemaphoreHandle_t ir_learn_semaphore_ = nullptr;
+    QueueHandle_t ir_command_queue_ = nullptr;  // Queue to defer callback from ISR
+    TaskHandle_t ir_learn_task_handle_ = nullptr;  // Task handle for cleanup
+    bool ir_learning_active_ = false;
+    uint64_t learned_command_ = 0;
+    std::string learned_protocol_ = "";
+    std::vector<uint32_t> learned_raw_data_;
+    
+    struct IRCommandEvent {
+        uint64_t command;
+        std::string protocol;
+        std::vector<uint32_t> raw_data;
+    };
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
@@ -85,6 +109,14 @@ private:
                 ResetWifiConfiguration();
             }
             app.ToggleChatState();
+        });
+
+        // Long press (3 seconds) to enter WiFi configuration mode
+        boot_button_.OnLongPress([this]() {
+            power_save_timer_->WakeUp();
+            ESP_LOGI(TAG, "Boot button long pressed (3s), entering WiFi configuration mode");
+            GetDisplay()->ShowNotification("Đang vào chế độ cấu hình WiFi...");
+            ResetWifiConfiguration();
         });
 
         volume_up_button_.OnClick([this]() {
@@ -150,9 +182,191 @@ private:
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
+    void InitializeIRReceiver() {
+        ir_receiver_ = new IRReceiver(IR_RECEIVER_GPIO);
+        ir_learn_semaphore_ = xSemaphoreCreateBinary();
+        if (ir_learn_semaphore_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create IR learn semaphore");
+            // Continue without semaphore - learning will fail gracefully
+        }
+        
+        // Create queue to defer callback from ISR to task context
+        ir_command_queue_ = xQueueCreate(5, sizeof(IRCommandEvent*));
+        if (ir_command_queue_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create IR command queue");
+        }
+        
+        // Set callback for decoded commands (only for learning mode via MCP tool)
+        // This callback may be called from ISR or task context, so we defer processing to task context
+        ir_receiver_->OnCommandReceived([this](uint64_t command, const std::string& protocol) {
+            if (ir_learning_active_ && ir_command_queue_ != nullptr) {
+                // Allocate event on heap to pass through queue
+                IRCommandEvent* event = new IRCommandEvent();
+                event->command = command;
+                event->protocol = protocol;
+                event->raw_data = ir_receiver_->GetRawData();
+                
+                // Try to send to queue (works from both ISR and task context)
+                // First try FromISR (safe even if not in ISR)
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                BaseType_t result = xQueueSendFromISR(ir_command_queue_, &event, &xHigherPriorityTaskWoken);
+                
+                if (result != pdTRUE) {
+                    // If FromISR failed, try normal send (we might not be in ISR)
+                    if (xQueueSend(ir_command_queue_, &event, 0) != pdTRUE) {
+                        ESP_LOGW(TAG, "IR command queue full, dropping command");
+                        delete event;
+                    }
+                } else {
+                    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+                }
+            }
+        });
+        
+        // Create task to process IR commands from queue
+        xTaskCreate([](void* param) {
+            XINGZHI_CUBE_1_54TFT_WIFI* board = static_cast<XINGZHI_CUBE_1_54TFT_WIFI*>(param);
+            IRCommandEvent* event = nullptr;
+            
+            while (true) {
+                if (xQueueReceive(board->ir_command_queue_, &event, portMAX_DELAY) == pdTRUE) {
+                    if (event && board->ir_learning_active_) {
+                        // Process in task context (safe for display and semaphore operations)
+                        board->learned_command_ = event->command;
+                        board->learned_protocol_ = event->protocol;
+                        board->learned_raw_data_ = event->raw_data;
+                        board->ir_learning_active_ = false;
+                        
+                        if (board->ir_learn_semaphore_ != nullptr) {
+                            xSemaphoreGive(board->ir_learn_semaphore_);
+                        }
+                        
+                        std::string message = "Đã học: " + event->protocol + " 0x";
+                        char hex_str[19];
+                        snprintf(hex_str, sizeof(hex_str), "%016" PRIX64, event->command);
+                        message += hex_str;
+                        board->GetDisplay()->ShowNotification(message);
+                        ESP_LOGI(TAG, "IR Command learned: %s - 0x%016" PRIX64, event->protocol.c_str(), event->command);
+                    }
+                    
+                    if (event) {
+                        delete event;
+                    }
+                }
+            }
+        }, "ir_learn_task", 4096, this, 5, &ir_learn_task_handle_);
+        
+        ESP_LOGI(TAG, "IR Receiver initialized on GPIO %d", IR_RECEIVER_GPIO);
+    }
+    
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        
+        // Add IR learning tool
+        mcp_server.AddTool("self.ir.learn_command",
+            "Learn an IR command from the IR remote. This tool will enable the IR receiver and wait for a signal from the remote control.\n"
+            "The tool will return the learned command information including protocol, command code, and raw timing data.\n"
+            "Args:\n"
+            "  `timeout`: Optional timeout in seconds (default: 10 seconds). If no signal is received within this time, the tool will return an error.\n"
+            "Return:\n"
+            "  A JSON object containing:\n"
+            "    - `protocol`: The detected IR protocol (NEC, RC5, Sony, or Raw)\n"
+            "    - `command`: The command code in hexadecimal format (0xXXXXXXXX)\n"
+            "    - `raw_data`: Array of timing pulses in microseconds (only for Raw protocol)\n"
+            "    - `success`: true if a command was learned successfully",
+            PropertyList({
+                Property("timeout", kPropertyTypeInteger, 10, 1, 60)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int timeout_seconds = properties["timeout"].value<int>();
+                
+                // Check if IR receiver is available
+                if (ir_receiver_ == nullptr) {
+                    throw std::runtime_error("IR Receiver not initialized");
+                }
+                
+                // Reset learning state
+                learned_command_ = 0;
+                learned_protocol_ = "";
+                learned_raw_data_.clear();
+                ir_learning_active_ = true;
+                
+                // Enable IR receiver if not already running
+                if (!ir_receiver_->IsRunning()) {
+                    ir_receiver_->Start();
+                    ESP_LOGI(TAG, "IR Receiver started for learning");
+                }
+                
+                // Check if semaphore is available
+                if (ir_learn_semaphore_ == nullptr) {
+                    ESP_LOGE(TAG, "IR learn semaphore not available");
+                    cJSON* json = cJSON_CreateObject();
+                    cJSON_AddBoolToObject(json, "success", false);
+                    cJSON_AddStringToObject(json, "error", "IR learning system not properly initialized");
+                    return json;
+                }
+                
+                GetDisplay()->ShowNotification("Đang chờ lệnh IR...");
+                ESP_LOGI(TAG, "Waiting for IR command (timeout: %d seconds)", timeout_seconds);
+                
+                // Wait for IR command with timeout
+                // Use smaller timeout chunks to avoid watchdog issues
+                TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_seconds * 1000);
+                TickType_t start_time = xTaskGetTickCount();
+                BaseType_t result = pdFALSE;
+                
+                while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+                    // Check every 1 second to avoid blocking too long
+                    TickType_t remaining = timeout_ticks - (xTaskGetTickCount() - start_time);
+                    TickType_t wait_time = remaining > pdMS_TO_TICKS(1000) ? pdMS_TO_TICKS(1000) : remaining;
+                    
+                    result = xSemaphoreTake(ir_learn_semaphore_, wait_time);
+                    if (result == pdTRUE) {
+                        break;
+                    }
+                }
+                
+                if (result == pdTRUE) {
+                    // Successfully received a command
+                    cJSON* json = cJSON_CreateObject();
+                    cJSON_AddBoolToObject(json, "success", true);
+                    cJSON_AddStringToObject(json, "protocol", learned_protocol_.c_str());
+                    
+                    if (learned_protocol_ != "UNKNOWN" && learned_protocol_ != "Raw" && learned_command_ != 0) {
+                        char hex_str[19];
+                        snprintf(hex_str, sizeof(hex_str), "0x%016" PRIX64, learned_command_);
+                        cJSON_AddStringToObject(json, "command", hex_str);
+                    }
+                    
+                    // Always include raw data if available
+                    if (!learned_raw_data_.empty()) {
+                        cJSON* raw_array = cJSON_CreateArray();
+                        for (size_t i = 0; i < learned_raw_data_.size() && i < 200; i++) { // Limit to 200 pulses
+                            cJSON_AddItemToArray(raw_array, cJSON_CreateNumber(learned_raw_data_[i]));
+                        }
+                        cJSON_AddItemToObject(json, "raw_data", raw_array);
+                    }
+                    
+                    return json;
+                } else {
+                    // Timeout
+                    ir_learning_active_ = false;
+                    GetDisplay()->ShowNotification("Hết thời gian chờ");
+                    ESP_LOGW(TAG, "IR learning timeout after %d seconds", timeout_seconds);
+                    
+                    cJSON* json = cJSON_CreateObject();
+                    cJSON_AddBoolToObject(json, "success", false);
+                    cJSON_AddStringToObject(json, "error", "Timeout: No IR signal received");
+                    return json;
+                }
+            });
+        
+        ESP_LOGI(TAG, "IR learning tool registered");
+    }
+
 public:
     XINGZHI_CUBE_1_54TFT_WIFI() :
-        boot_button_(BOOT_BUTTON_GPIO),
+        boot_button_(BOOT_BUTTON_GPIO, false, 3000, 0, false),  // long_press_time = 3000ms (3 seconds)
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
         InitializePowerManager();
@@ -160,7 +374,36 @@ public:
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();
+        InitializeIRReceiver();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
+    }
+
+    ~XINGZHI_CUBE_1_54TFT_WIFI() {
+        // Stop IR receiver if running
+        if (ir_receiver_ != nullptr) {
+            ir_receiver_->Stop();
+            delete ir_receiver_;
+            ir_receiver_ = nullptr;
+        }
+
+        // Delete task first (it uses the queue)
+        if (ir_learn_task_handle_ != nullptr) {
+            vTaskDelete(ir_learn_task_handle_);
+            ir_learn_task_handle_ = nullptr;
+        }
+
+        // Delete semaphore
+        if (ir_learn_semaphore_ != nullptr) {
+            vSemaphoreDelete(ir_learn_semaphore_);
+            ir_learn_semaphore_ = nullptr;
+        }
+        
+        // Delete queue
+        if (ir_command_queue_ != nullptr) {
+            vQueueDelete(ir_command_queue_);
+            ir_command_queue_ = nullptr;
+        }
     }
 
     virtual AudioCodec* GetAudioCodec() override {
