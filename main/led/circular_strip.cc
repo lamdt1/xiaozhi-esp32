@@ -299,6 +299,8 @@ void CircularStrip::Disable() {
         led_strip_ = nullptr;
         ESP_LOGI(TAG, "LED strip disabled (RMT channel freed)");
     }
+    // Release mutex before delay to allow other operations
+    // Note: RMT channel release is asynchronous, caller should add delay after Disable()
 }
 
 void CircularStrip::Enable() {

@@ -383,11 +383,15 @@ private:
                         single_led->Disable();
                         led_was_enabled = true;
                         ESP_LOGI(TAG, "SingleLed disabled successfully");
+                        // Immediate delay after disable to allow RMT driver to start cleanup
+                        vTaskDelay(pdMS_TO_TICKS(100));
                     } else if (circular_strip != nullptr) {
                         ESP_LOGI(TAG, "Disabling CircularStrip to free RMT channels...");
                         circular_strip->Disable();
                         led_was_enabled = true;
                         ESP_LOGI(TAG, "CircularStrip disabled successfully");
+                        // Immediate delay after disable to allow RMT driver to start cleanup
+                        vTaskDelay(pdMS_TO_TICKS(100));
                     } else {
                         ESP_LOGI(TAG, "LED is not a SingleLed or CircularStrip, skipping disable");
                     }
@@ -397,26 +401,44 @@ private:
                 
                 // Longer delay to allow RMT channels to be fully released after LED deletion
                 // RMT driver needs time to clean up internal state
+                // led_strip_del() is asynchronous and may need multiple retries
+                // Total delay: 100ms (after Disable) + 1000ms (here) = 1100ms
                 ESP_LOGI(TAG, "Waiting for RMT channels to be released...");
-                vTaskDelay(pdMS_TO_TICKS(300));  // Increased delay for RMT cleanup
+                vTaskDelay(pdMS_TO_TICKS(1000));  // Increased delay for RMT cleanup
                 
                 // Ensure IR receiver is stopped and cleaned up before starting
                 // This helps free any RMT channels it might be holding
                 ir_receiver_->Stop();
-                vTaskDelay(pdMS_TO_TICKS(100));  // Allow time for RMT channel release
+                vTaskDelay(pdMS_TO_TICKS(200));  // Allow time for RMT channel release
                 
-                // Enable IR receiver - reuse existing channel if available
-                // Start() will handle channel reuse or creation
-                ir_receiver_->Start();
-                
-                // Retry with delay if first attempt fails (allows time for other RMT channels to release)
-                if (!ir_receiver_->IsRunning()) {
-                    ESP_LOGW(TAG, "First IR receiver start attempt failed, retrying after delay...");
-                    vTaskDelay(pdMS_TO_TICKS(200));  // Wait longer for RMT channels to be released
+                // Retry logic with exponential backoff for starting IR receiver
+                // RMT channel release can be delayed, so we retry multiple times
+                // Use longer delays and more retries to handle slow RMT channel release
+                const int max_retries = 8;
+                bool started = false;
+                for (int retry = 0; retry < max_retries; retry++) {
                     ir_receiver_->Start();
+                    if (ir_receiver_->IsRunning()) {
+                        started = true;
+                        ESP_LOGI(TAG, "IR Receiver started successfully on attempt %d", retry + 1);
+                        break;
+                    }
+                    
+                    if (retry < max_retries - 1) {
+                        // Exponential backoff with longer delays: 500ms, 1000ms, 2000ms, 3000ms, 3000ms...
+                        int delay_ms;
+                        if (retry < 3) {
+                            delay_ms = 500 * (1 << retry);  // 500, 1000, 2000
+                        } else {
+                            delay_ms = 3000;  // 3000ms for remaining retries
+                        }
+                        ESP_LOGW(TAG, "IR receiver start attempt %d failed, retrying after %dms...", 
+                                retry + 1, delay_ms);
+                        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                    }
                 }
                 
-                if (!ir_receiver_->IsRunning()) {
+                if (!started) {
                     ESP_LOGE(TAG, "Failed to start IR Receiver after retry");
                     ir_learning_active_.store(false, std::memory_order_release);
                     
