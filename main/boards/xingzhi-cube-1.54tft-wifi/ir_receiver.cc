@@ -47,7 +47,14 @@ IRReceiver::~IRReceiver() {
 
 void IRReceiver::Start() {
     if (is_running_) {
+        ESP_LOGW(TAG, "IR Receiver already running");
         return;
+    }
+
+    // Ensure any previous channel is cleaned up
+    if (rmt_rx_channel_ != nullptr) {
+        ESP_LOGW(TAG, "Cleaning up existing RMT channel before starting");
+        Stop();
     }
 
     // Configure RMT receiver
@@ -62,19 +69,32 @@ void IRReceiver::Start() {
         }
     };
     
-    ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_channel_cfg, &rmt_rx_channel_));
+    esp_err_t ret = rmt_new_rx_channel(&rx_channel_cfg, &rmt_rx_channel_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create RMT RX channel: %s (0x%x)", esp_err_to_name(ret), ret);
+        rmt_rx_channel_ = nullptr;
+        return;
+    }
     
     // Register callback first
     rmt_rx_event_callbacks_t cbs = {
         .on_recv_done = rmt_rx_done_callback,
     };
-    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rmt_rx_channel_, &cbs, this));
+    ret = rmt_rx_register_event_callbacks(rmt_rx_channel_, &cbs, this);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register RMT callbacks: %s", esp_err_to_name(ret));
+        rmt_del_channel(rmt_rx_channel_);
+        rmt_rx_channel_ = nullptr;
+        return;
+    }
     
     // Allocate buffer for received symbols
     if (!received_symbols_) {
         received_symbols_ = (rmt_symbol_word_t*)malloc(sizeof(rmt_symbol_word_t) * 1024);
         if (!received_symbols_) {
             ESP_LOGE(TAG, "Failed to allocate memory for RMT symbols");
+            rmt_del_channel(rmt_rx_channel_);
+            rmt_rx_channel_ = nullptr;
             return;
         }
     }
@@ -85,22 +105,44 @@ void IRReceiver::Start() {
         .signal_range_max_ns = 0x7FFFFFFF,
     };
     
-    ESP_ERROR_CHECK(rmt_enable(rmt_rx_channel_));
-    ESP_ERROR_CHECK(rmt_receive(rmt_rx_channel_, received_symbols_, 
-                                 sizeof(rmt_symbol_word_t) * 1024, &receive_cfg));
+    ret = rmt_enable(rmt_rx_channel_);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable RMT channel: %s", esp_err_to_name(ret));
+        rmt_del_channel(rmt_rx_channel_);
+        rmt_rx_channel_ = nullptr;
+        return;
+    }
+    
+    ret = rmt_receive(rmt_rx_channel_, received_symbols_, 
+                     sizeof(rmt_symbol_word_t) * 1024, &receive_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start RMT receive: %s", esp_err_to_name(ret));
+        rmt_disable(rmt_rx_channel_);
+        rmt_del_channel(rmt_rx_channel_);
+        rmt_rx_channel_ = nullptr;
+        return;
+    }
     
     is_running_ = true;
     ESP_LOGI(TAG, "IR Receiver started on GPIO %d", gpio_num_);
 }
 
 void IRReceiver::Stop() {
-    if (!is_running_) {
+    if (!is_running_ && rmt_rx_channel_ == nullptr) {
         return;
     }
 
     if (rmt_rx_channel_) {
-        rmt_disable(rmt_rx_channel_);
-        rmt_del_channel(rmt_rx_channel_);
+        // Disable and delete channel
+        esp_err_t ret = rmt_disable(rmt_rx_channel_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to disable RMT channel: %s", esp_err_to_name(ret));
+        }
+        
+        ret = rmt_del_channel(rmt_rx_channel_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to delete RMT channel: %s", esp_err_to_name(ret));
+        }
         rmt_rx_channel_ = nullptr;
     }
     
@@ -140,14 +182,13 @@ void IRReceiver::ProcessReceivedData(const rmt_symbol_word_t* symbols, size_t sy
         return;
     }
 
-    // Store raw data
+    // Store raw data - store duration0 and duration1 separately for each symbol
+    // This matches the DecodeRaw implementation and allows proper reconstruction of IR signals
     raw_data_.clear();
     raw_data_.reserve(symbol_num * 2);
     for (size_t i = 0; i < symbol_num; i++) {
-        raw_data_.push_back(GetSymbolDuration(symbols[i]));
-        if (i < symbol_num - 1) {
-            raw_data_.push_back(symbols[i].duration1);
-        }
+        raw_data_.push_back(symbols[i].duration0);
+        raw_data_.push_back(symbols[i].duration1);
     }
 
     // Try to decode different protocols
@@ -254,8 +295,10 @@ bool IRReceiver::DecodeSony(const rmt_symbol_word_t* symbols, size_t symbol_num,
     }
 
     // Decode bits (12, 15, or 20 bits)
+    // Sony protocol: 1 symbol per bit (symbol[0] is header, symbols[1..N] are data bits)
+    // Each symbol contains: duration0 = mark, duration1 = space
     command = 0;
-    size_t bits_to_decode = std::min((symbol_num - 2) / 2, size_t(20));
+    size_t bits_to_decode = std::min(symbol_num - 1, size_t(20));  // -1 for header symbol
     
     for (size_t i = 1; i <= bits_to_decode && i < symbol_num; i++) {
         if (!IsDurationInRange(symbols[i].duration0, SONY_BIT_MARK, SONY_TOLERANCE)) {
