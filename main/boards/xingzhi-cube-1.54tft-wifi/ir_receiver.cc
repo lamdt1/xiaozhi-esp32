@@ -5,8 +5,12 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <sys/queue.h>
+#include <driver/rmt_rx.h>
 
 #define TAG "IRReceiver"
+
+// Static member initialization
+IRReceiver* IRReceiver::current_instance_ = nullptr;
 
 // Protocol timing constants (in microseconds)
 #define NEC_HEADER_MARK 9000
@@ -39,9 +43,15 @@ IRReceiver::~IRReceiver() {
     Stop();
     
     // Delete ir_learn handle in destructor to free resources
+    // ir_learn_stop deletes the handle when passed a pointer
     if (ir_learn_handle_ != nullptr) {
-        ir_learn_del(&ir_learn_handle_);
+        ir_learn_stop(&ir_learn_handle_);
         ir_learn_handle_ = nullptr;
+    }
+    
+    // Clear static instance if this is the current one
+    if (current_instance_ == this) {
+        current_instance_ = nullptr;
     }
 }
 
@@ -53,26 +63,27 @@ void IRReceiver::Start() {
 
     // Create ir_learn handle if not exists
     if (ir_learn_handle_ == nullptr) {
+        // Set static instance pointer for callback
+        current_instance_ = this;
+        
         ir_learn_cfg_t config = {
-            .learn_count = 1,  // Learn once per command
-            .learn_gpio = gpio_num_,
             .clk_src = RMT_CLK_SRC_DEFAULT,
             .resolution = 1000000,  // 1MHz = 1us per tick
-            .task_stack = 4096,
-            .task_priority = 5,
-            .task_affinity = -1,  // No affinity
+            .learn_count = 1,  // Learn once per command
+            .learn_gpio = gpio_num_,
             .callback = ir_learn_callback,
-            .user_data = this,  // Pass this instance as user data
+            .task_priority = 5,
+            .task_stack = 4096,
+            .task_affinity = -1,  // No affinity
         };
         
         esp_err_t ret = ir_learn_new(&config, &ir_learn_handle_);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to create ir_learn handle: %s (0x%x)", esp_err_to_name(ret), ret);
             ir_learn_handle_ = nullptr;
+            current_instance_ = nullptr;
             return;
         }
-        
-        // Note: ir_learn callback receives user_data from config, not via separate setter
     }
     
     // Start learning
@@ -115,8 +126,9 @@ void IRReceiver::Process() {
 }
 
 void IRReceiver::ir_learn_callback(ir_learn_state_t state, uint8_t sub_step, 
-                                    struct ir_learn_sub_list_head *data, void *user_data) {
-    IRReceiver* receiver = static_cast<IRReceiver*>(user_data);
+                                    struct ir_learn_sub_list_head *data) {
+    // Get instance from static member
+    IRReceiver* receiver = current_instance_;
     if (receiver == nullptr) {
         return;
     }
@@ -140,10 +152,20 @@ void IRReceiver::ProcessLearnedData(ir_learn_state_t state, uint8_t sub_step, st
                 // ir_learn uses SLIST (singly-linked list) structure
                 struct ir_learn_sub_list_t *entry;
                 SLIST_FOREACH(entry, data, next) {
-                    // ir_learn provides timing data in microseconds
-                    // Each entry contains mark and space durations
-                    raw_data_.push_back(entry->mark);
-                    raw_data_.push_back(entry->space);
+                    // Extract timing data from RMT symbols
+                    // Each symbol contains level0/duration0 and level1/duration1
+                    const rmt_rx_done_event_data_t& rx_data = entry->symbols;
+                    
+                    // Convert RMT symbols to mark/space durations
+                    // Resolution is 1MHz (1us per tick), so duration values are already in microseconds
+                    // rmt_rx_done_event_data_t has 'received_symbols' (pointer) and 'num_symbols' (count)
+                    for (size_t i = 0; i < rx_data.num_symbols; i++) {
+                        const rmt_symbol_word_t& symbol = rx_data.received_symbols[i];
+                        // duration0 is the first pulse duration (mark or space depending on level0)
+                        raw_data_.push_back(symbol.duration0);
+                        // duration1 is the second pulse duration
+                        raw_data_.push_back(symbol.duration1);
+                    }
                 }
                 
                 // Try to decode known protocols

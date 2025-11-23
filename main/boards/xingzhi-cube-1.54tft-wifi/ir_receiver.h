@@ -57,8 +57,11 @@ private:
     CommandCallback command_callback_;
     RawDataCallback raw_data_callback_;
     
+    // Static member to store instance pointer for C callback
+    static IRReceiver* current_instance_;
+    
     static void ir_learn_callback(ir_learn_state_t state, uint8_t sub_step, 
-                                   struct ir_learn_sub_list_head *data, void *user_data);
+                                   struct ir_learn_sub_list_head *data);
     void ProcessLearnedData(ir_learn_state_t state, uint8_t sub_step, struct ir_learn_sub_list_head *data);
     
     // Protocol decoders (for compatibility, but ir_learn provides raw data)
