@@ -207,8 +207,13 @@ private:
         // IR Learning Mode Control
         ESP_LOGI(TAG, "Registering tool: self.ir.start_learning");
         mcp_server.AddTool("self.ir.start_learning", 
-            "Start IR learning mode. When enabled, the device will save any IR codes received. "
-            "Use this to learn IR commands from remote controls.",
+            "Start IR (infrared) learning mode to learn remote control commands.\n"
+            "Use this tool when the user asks to:\n"
+            "1. Learn IR commands, learn remote controls, learn hồng ngoại\n"
+            "2. Học lệnh hồng ngoại, học lệnh remote, vào chế độ học lệnh hồng ngoại\n"
+            "3. Start IR learning mode, begin learning remote commands\n"
+            "After calling this tool, the device will automatically save any IR codes received. "
+            "The user should point their remote at the device and press buttons to learn the commands.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 if (ir_receiver_ != nullptr) {
@@ -225,7 +230,9 @@ private:
         
         ESP_LOGI(TAG, "Registering tool: self.ir.stop_learning");
         mcp_server.AddTool("self.ir.stop_learning",
-            "Stop IR learning mode.",
+            "Stop IR (infrared) learning mode. "
+            "When the user asks to stop learning IR commands, stop learning remote, dừng học lệnh hồng ngoại, "
+            "or exit IR learning mode, you MUST call this tool.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 if (ir_receiver_ != nullptr) {
@@ -270,7 +277,9 @@ private:
         
         ESP_LOGI(TAG, "Registering tool: self.ir.list_codes");
         mcp_server.AddTool("self.ir.list_codes",
-            "List all learned IR codes.",
+            "List all learned IR (infrared) codes that have been saved. "
+            "When the user asks to see learned IR codes, list remote commands, xem danh sách lệnh hồng ngoại, "
+            "or show learned codes, you MUST call this tool.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 if (ir_receiver_ != nullptr) {
