@@ -22,6 +22,36 @@
 
 #define TAG "ZHENGCHEN_1_54TFT_WIFI"
 
+// Helper function to escape JSON string
+static std::string EscapeJsonString(const std::string& str) {
+    std::string escaped;
+    escaped.reserve(str.length() + 10); // Reserve some extra space for escape sequences
+    
+    for (char c : str) {
+        switch (c) {
+            case '"':  escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                // Escape control characters (0x00-0x1F)
+                if (c >= 0 && c < 0x20) {
+                    char hex[7];
+                    snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
+                    escaped += hex;
+                } else {
+                    escaped += c;
+                }
+                break;
+        }
+    }
+    
+    return escaped;
+}
+
 class ZHENGCHEN_1_54TFT_WIFI : public WifiBoard {
 private:
     Button boot_button_;
@@ -175,6 +205,7 @@ private:
         ESP_LOGI(TAG, "Initializing IR MCP tools...");
         
         // IR Learning Mode Control
+        ESP_LOGI(TAG, "Registering tool: self.ir.start_learning");
         mcp_server.AddTool("self.ir.start_learning", 
             "Start IR learning mode. When enabled, the device will save any IR codes received. "
             "Use this to learn IR commands from remote controls.",
@@ -192,6 +223,7 @@ private:
                 return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
             });
         
+        ESP_LOGI(TAG, "Registering tool: self.ir.stop_learning");
         mcp_server.AddTool("self.ir.stop_learning",
             "Stop IR learning mode.",
             PropertyList(),
@@ -203,6 +235,7 @@ private:
                 return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
             });
         
+        ESP_LOGI(TAG, "Registering tool: self.ir.save_code");
         mcp_server.AddTool("self.ir.save_code",
             "Save a learned IR code with a custom name. Use this after learning an IR code to give it a meaningful name.",
             PropertyList({
@@ -230,9 +263,12 @@ private:
                 }
                 
                 ir_receiver_->SaveLearnedCode(name, static_cast<decode_type_t>(protocol), value, bits);
-                return "{\"status\":\"success\",\"message\":\"IR code saved: " + name + "\"}";
+                // Escape name to prevent JSON injection
+                std::string escaped_name = EscapeJsonString(name);
+                return "{\"status\":\"success\",\"message\":\"IR code saved: " + escaped_name + "\"}";
             });
         
+        ESP_LOGI(TAG, "Registering tool: self.ir.list_codes");
         mcp_server.AddTool("self.ir.list_codes",
             "List all learned IR codes.",
             PropertyList(),
@@ -243,6 +279,7 @@ private:
                 return "{\"codes\":[]}";
             });
         
+        ESP_LOGI(TAG, "Registering tool: self.ir.get_learning_status");
         mcp_server.AddTool("self.ir.get_learning_status",
             "Get the current status of IR learning mode.",
             PropertyList(),

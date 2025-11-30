@@ -6,6 +6,36 @@
 
 #define TAG "IRReceiver"
 
+// Helper function to escape JSON string
+static std::string EscapeJsonString(const std::string& str) {
+    std::string escaped;
+    escaped.reserve(str.length() + 10); // Reserve some extra space for escape sequences
+    
+    for (char c : str) {
+        switch (c) {
+            case '"':  escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                // Escape control characters (0x00-0x1F)
+                if (c >= 0 && c < 0x20) {
+                    char hex[7];
+                    snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
+                    escaped += hex;
+                } else {
+                    escaped += c;
+                }
+                break;
+        }
+    }
+    
+    return escaped;
+}
+
 IrReceiver::IrReceiver(gpio_num_t rx_pin)
     : rx_pin_(rx_pin), irrecv_(nullptr), task_handle_(nullptr), running_(false), learning_mode_(false) {
     // Initialize Arduino compatibility layer (required for IRremoteESP8266)
@@ -116,8 +146,30 @@ void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol
     settings.SetString(code_key, code_value);
     
     // Also save the list of learned code names
+    // Check for exact token match (not substring match) in comma-delimited list
     std::string code_list = settings.GetString("code_list", "");
-    if (code_list.find(name) == std::string::npos) {
+    bool name_exists = false;
+    
+    if (!code_list.empty()) {
+        size_t pos = 0;
+        while (pos < code_list.length()) {
+            size_t comma_pos = code_list.find(',', pos);
+            std::string code_name = (comma_pos == std::string::npos) ? 
+                code_list.substr(pos) : code_list.substr(pos, comma_pos - pos);
+            
+            // Exact match check
+            if (code_name == name) {
+                name_exists = true;
+                break;
+            }
+            
+            if (comma_pos == std::string::npos) break;
+            pos = comma_pos + 1;
+        }
+    }
+    
+    // Only add if name doesn't exist
+    if (!name_exists) {
         if (!code_list.empty()) {
             code_list += ",";
         }
@@ -153,7 +205,9 @@ std::string IrReceiver::GetLearnedCodes() const {
             
             if (!code_value.empty()) {
                 if (!first) json += ",";
-                json += "{\"name\":\"" + code_name + "\",\"data\":" + code_value + "}";
+                // Escape code_name to prevent JSON injection
+                std::string escaped_name = EscapeJsonString(code_name);
+                json += "{\"name\":\"" + escaped_name + "\",\"data\":" + code_value + "}";
                 first = false;
             }
         }
