@@ -18,6 +18,7 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <string>
 
 class IrReceiver {
 public:
@@ -45,6 +46,7 @@ private:
     gpio_num_t rx_pin_;
     IRrecv* irrecv_;
     TaskHandle_t task_handle_;
+    std::mutex task_handle_mutex_;  // Protects task_handle_ access
     IrCallback callback_;
     IrLearningCallback learning_callback_;
     std::mutex learning_callback_mutex_;  // Protects learning_callback_ access

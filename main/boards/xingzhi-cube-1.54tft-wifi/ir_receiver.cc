@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <mutex>
 
 #define TAG "IRReceiver"
@@ -87,11 +88,18 @@ void IrReceiver::Start() {
     running_.store(true);
     
     // Create task to process IR signals
-    BaseType_t result = xTaskCreate(IrTask, "ir_receiver_task", 4096, this, 5, &task_handle_);
-    if (result != pdPASS || task_handle_ == nullptr) {
+    TaskHandle_t new_handle = nullptr;
+    BaseType_t result = xTaskCreate(IrTask, "ir_receiver_task", 4096, this, 5, &new_handle);
+    if (result != pdPASS || new_handle == nullptr) {
         ESP_LOGE(TAG, "Failed to create IR receiver task (result=%d)", result);
         running_.store(false);
         return;
+    }
+    
+    // Store task handle under mutex protection
+    {
+        std::lock_guard<std::mutex> lock(task_handle_mutex_);
+        task_handle_ = new_handle;
     }
     
     ESP_LOGI(TAG, "IR receiver task started");
@@ -108,27 +116,25 @@ void IrReceiver::Stop() {
     // The task will delete itself using vTaskDelete(NULL) after ProcessIrTask() returns
     // We just wait for it to complete - do not try to delete it from here
     TaskHandle_t handle_to_wait = nullptr;
-    taskENTER_CRITICAL();
-    handle_to_wait = task_handle_;
-    taskEXIT_CRITICAL();
+    {
+        std::lock_guard<std::mutex> lock(task_handle_mutex_);
+        handle_to_wait = task_handle_;
+    }
     
     if (handle_to_wait != nullptr) {
         // Wait for task to exit its loop and delete itself
         // Give it reasonable time to finish (max 1 second)
         for (int i = 0; i < 10; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            taskENTER_CRITICAL();
-            bool still_exists = (task_handle_ != nullptr);
-            taskEXIT_CRITICAL();
-            if (!still_exists) {
+            std::lock_guard<std::mutex> lock(task_handle_mutex_);
+            if (task_handle_ == nullptr) {
                 break; // Task has deleted itself
             }
         }
         
         // Clear handle if task hasn't deleted itself yet (shouldn't happen normally)
-        taskENTER_CRITICAL();
+        std::lock_guard<std::mutex> lock(task_handle_mutex_);
         task_handle_ = nullptr;
-        taskEXIT_CRITICAL();
     }
     
     ESP_LOGI(TAG, "IR receiver task stopped");
@@ -149,6 +155,8 @@ void IrReceiver::SetLearningCallback(IrLearningCallback callback) {
 }
 
 void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol, uint64_t value, uint16_t bits) {
+    ESP_LOGI(TAG, "SaveLearnedCode called: name=%s, protocol=%d, value=0x%llx, bits=%d", 
+             name.c_str(), protocol, value, bits);
     Settings settings("ir_codes", true);
     
     // Validate and truncate name length to prevent silent truncation in snprintf
@@ -212,7 +220,8 @@ void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol
         settings.SetString("code_list", code_list);
     }
     
-    ESP_LOGI(TAG, "Saved IR code: %s (protocol=%d, value=0x%llx)", truncated_name.c_str(), protocol, value);
+    ESP_LOGI(TAG, "Successfully saved IR code: %s (protocol=%d, value=0x%llx, bits=%d)", 
+             truncated_name.c_str(), protocol, value, bits);
 }
 
 std::string IrReceiver::GetLearnedCodes() const {
@@ -273,10 +282,11 @@ void IrReceiver::IrTask(void* arg) {
     receiver->ProcessIrTask();
     
     // Clear task handle before deleting self to prevent Stop() from accessing invalid handle
-    // Use critical section to ensure atomic operation
-    taskENTER_CRITICAL();
-    receiver->task_handle_ = nullptr;
-    taskEXIT_CRITICAL();
+    // Use mutex to ensure atomic operation
+    {
+        std::lock_guard<std::mutex> lock(receiver->task_handle_mutex_);
+        receiver->task_handle_ = nullptr;
+    }
     
     // Task deletes itself - this is the safe pattern in FreeRTOS
     // vTaskDelete(NULL) deletes the calling task
@@ -301,6 +311,10 @@ void IrReceiver::ProcessIrTask() {
         
         // Check if IR data is available
         if (irrecv_->decode(&results)) {
+            bool is_learning = learning_mode_.load();
+            ESP_LOGI(TAG, "IR decode result: protocol=%d, value=0x%llx, bits=%d, learning_mode=%d", 
+                     results.decode_type, results.value, results.bits, is_learning);
+            
             // Process the decoded result
             if (results.decode_type != UNKNOWN) {
                 // Print IR value in HEX format (following the guide)
@@ -315,8 +329,8 @@ void IrReceiver::ProcessIrTask() {
                 #endif
                 
                 // If in learning mode, trigger learning callback
-                bool is_learning = learning_mode_.load();
                 if (is_learning) {
+                    ESP_LOGI(TAG, "Learning mode active, processing IR code...");
                     // Safely copy callback under mutex protection
                     IrLearningCallback callback_copy;
                     {
@@ -325,10 +339,16 @@ void IrReceiver::ProcessIrTask() {
                     }
                     
                     if (callback_copy) {
+                        ESP_LOGI(TAG, "Calling learning callback with protocol=%d, value=0x%llx", 
+                                 results.decode_type, results.value);
                         // Generate a default name if needed
                         char default_name[32];
                         snprintf(default_name, sizeof(default_name), "IR_%llx", results.value);
-                        callback_copy(results.decode_type, results.value, results.bits, default_name);
+                        std::string name_str(default_name);
+                        callback_copy(results.decode_type, results.value, results.bits, name_str);
+                        ESP_LOGI(TAG, "Learning callback completed");
+                    } else {
+                        ESP_LOGW(TAG, "Learning callback is null, cannot save IR code");
                     }
                 }
                 
@@ -337,7 +357,25 @@ void IrReceiver::ProcessIrTask() {
                     callback_(results.decode_type, results.value, results.bits);
                 }
             } else {
-                ESP_LOGD(TAG, "IR received: UNKNOWN protocol, bits=%d", results.bits);
+                ESP_LOGW(TAG, "IR received: UNKNOWN protocol, bits=%d, value=0x%llx", 
+                         results.bits, results.value);
+                // In learning mode, we should still try to save UNKNOWN protocols
+                if (is_learning) {
+                    ESP_LOGI(TAG, "Learning mode: attempting to save UNKNOWN protocol code");
+                    IrLearningCallback callback_copy;
+                    {
+                        std::lock_guard<std::mutex> lock(learning_callback_mutex_);
+                        callback_copy = learning_callback_;
+                    }
+                    
+                    if (callback_copy) {
+                        char default_name[32];
+                        snprintf(default_name, sizeof(default_name), "IR_UNKNOWN_%llx", results.value);
+                        std::string name_str(default_name);
+                        callback_copy(results.decode_type, results.value, results.bits, name_str);
+                        ESP_LOGI(TAG, "UNKNOWN protocol code saved via learning callback");
+                    }
+                }
             }
             
             // Resume receiving (important for next value)
