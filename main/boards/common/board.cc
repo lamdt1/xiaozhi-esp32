@@ -13,6 +13,8 @@
 #define TAG "Board"
 
 Board::Board() {
+    ESP_LOGI(TAG, "=== Board::Board() constructor called ===");
+    ESP_LOGI(TAG, "BOARD_NAME=%s", BOARD_NAME);
     Settings settings("board", true);
     uuid_ = settings.GetString("uuid");
     if (uuid_.empty()) {
@@ -20,6 +22,7 @@ Board::Board() {
         settings.SetString("uuid", uuid_);
     }
     ESP_LOGI(TAG, "UUID=%s SKU=%s", uuid_.c_str(), BOARD_NAME);
+    ESP_LOGI(TAG, "=== Board::Board() constructor completed ===");
 }
 
 std::string Board::GenerateUuid() {

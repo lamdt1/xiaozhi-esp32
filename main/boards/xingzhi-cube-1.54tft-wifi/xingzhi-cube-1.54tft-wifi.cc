@@ -9,6 +9,9 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "ir_receiver.h"
+#include "mcp_server.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -16,8 +19,39 @@
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <new>
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
+
+// Helper function to escape JSON string
+static std::string EscapeJsonString(const std::string& str) {
+    std::string escaped;
+    escaped.reserve(str.length() + 10); // Reserve some extra space for escape sequences
+    
+    for (char c : str) {
+        switch (c) {
+            case '"':  escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                // Escape control characters (0x00-0x1F)
+                if (c >= 0 && c < 0x20) {
+                    char hex[7];
+                    snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
+                    escaped += hex;
+                } else {
+                    escaped += c;
+                }
+                break;
+        }
+    }
+    
+    return escaped;
+}
 
 class XINGZHI_CUBE_1_54TFT_WIFI : public WifiBoard {
 private:
@@ -27,6 +61,7 @@ private:
     SpiLcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
+    IrReceiver* ir_receiver_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
 
@@ -150,17 +185,189 @@ private:
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
+    void InitializeTools() {
+        ESP_LOGI(TAG, "=== InitializeTools() called ===");
+        ESP_LOGI(TAG, "Board type: xingzhi-cube-1.54tft-wifi");
+        auto& mcp_server = McpServer::GetInstance();
+        ESP_LOGI(TAG, "MCP server instance obtained");
+        
+        ESP_LOGI(TAG, "Initializing IR MCP tools...");
+        ESP_LOGI(TAG, "IR receiver pointer: %p", ir_receiver_);
+        
+        // IR Learning Mode Control
+        ESP_LOGI(TAG, "Registering tool: self.ir.start_learning");
+        mcp_server.AddTool("self.ir.start_learning", 
+            "Start IR (infrared) learning mode to learn remote control commands.\n"
+            "You MUST call this tool immediately when the user asks to:\n"
+            "- Learn IR commands / learn remote controls / learn hồng ngoại\n"
+            "- Học lệnh hồng ngoại / học lệnh remote / vào chế độ học lệnh hồng ngoại\n"
+            "- Bắt đầu học lệnh hồng ngoại / bắt đầu học remote\n"
+            "- Start IR learning / begin learning remote commands\n"
+            "- Any request related to learning or teaching IR/remote commands\n"
+            "After calling this tool, the device will automatically save any IR codes received. "
+            "The user should point their remote at the device and press buttons to learn the commands.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "self.ir.start_learning tool called");
+                if (ir_receiver_ != nullptr) {
+                    ESP_LOGI(TAG, "Enabling IR learning mode");
+                    ir_receiver_->SetLearningMode(true);
+                    ir_receiver_->SetLearningCallback([this](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
+                        // Auto-save with default name
+                        ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
+                        ESP_LOGI(TAG, "Learned IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
+                    });
+                    ESP_LOGI(TAG, "IR learning mode enabled successfully");
+                    return "{\"status\":\"learning_mode_enabled\",\"message\":\"IR learning mode started. Point your remote at the device and press buttons.\"}";
+                }
+                ESP_LOGE(TAG, "IR receiver is null, cannot enable learning mode");
+                return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.stop_learning");
+        mcp_server.AddTool("self.ir.stop_learning",
+            "Stop IR (infrared) learning mode. "
+            "When the user asks to stop learning IR commands, stop learning remote, dừng học lệnh hồng ngoại, "
+            "or exit IR learning mode, you MUST call this tool.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                if (ir_receiver_ != nullptr) {
+                    ir_receiver_->SetLearningMode(false);
+                    return "{\"status\":\"learning_mode_disabled\",\"message\":\"IR learning mode stopped.\"}";
+                }
+                return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.save_code");
+        mcp_server.AddTool("self.ir.save_code",
+            "Save a learned IR code with a custom name. Use this after learning an IR code to give it a meaningful name.",
+            PropertyList({
+                Property("name", kPropertyTypeString),
+                Property("protocol", kPropertyTypeInt),
+                Property("value", kPropertyTypeString),  // Value as hex string
+                Property("bits", kPropertyTypeInt)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                if (ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                }
+                
+                auto name = properties["name"].value<std::string>();
+                int protocol = properties["protocol"].value<int>();
+                auto value_str = properties["value"].value<std::string>();
+                int bits = properties["bits"].value<int>();
+                
+                // Convert hex string to uint64_t
+                uint64_t value = 0;
+                try {
+                    value = std::stoull(value_str, nullptr, 16);
+                } catch (...) {
+                    return "{\"status\":\"error\",\"message\":\"Invalid value format. Use hex string (e.g., 0xFF00)\"}";
+                }
+                
+                ir_receiver_->SaveLearnedCode(name, static_cast<decode_type_t>(protocol), value, bits);
+                // Escape name to prevent JSON injection
+                std::string escaped_name = EscapeJsonString(name);
+                return "{\"status\":\"success\",\"message\":\"IR code saved: " + escaped_name + "\"}";
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.list_codes");
+        mcp_server.AddTool("self.ir.list_codes",
+            "List all learned IR (infrared) codes that have been saved. "
+            "When the user asks to see learned IR codes, list remote commands, xem danh sách lệnh hồng ngoại, "
+            "or show learned codes, you MUST call this tool.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                if (ir_receiver_ != nullptr) {
+                    return ir_receiver_->GetLearnedCodes();
+                }
+                return "{\"codes\":[]}";
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.get_learning_status");
+        mcp_server.AddTool("self.ir.get_learning_status",
+            "Get the current status of IR learning mode.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                if (ir_receiver_ != nullptr) {
+                    bool learning = ir_receiver_->IsLearningMode();
+                    return learning ? "{\"learning_mode\":true}" : "{\"learning_mode\":false}";
+                }
+                return "{\"learning_mode\":false,\"error\":\"IR receiver not initialized\"}";
+            });
+        
+        ESP_LOGI(TAG, "IR MCP tools initialized successfully");
+        ESP_LOGI(TAG, "Total IR tools registered: 5 (start_learning, stop_learning, save_code, list_codes, get_learning_status)");
+    }
+
+    void InitializeIrReceiver() {
+        ir_receiver_ = new (std::nothrow) IrReceiver(IR_RX_PIN);
+        if (ir_receiver_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create IR receiver (out of memory)");
+            return;
+        }
+        
+        // Set callback to handle IR commands
+        ir_receiver_->SetCallback([this](decode_type_t protocol, uint64_t value, uint16_t bits) {
+            ESP_LOGI(TAG, "IR command received: protocol=%d, value=0x%llx", protocol, value);
+            
+            // Wake up from power save mode when IR command is received
+            if (power_save_timer_ != nullptr) {
+                power_save_timer_->WakeUp();
+            }
+            
+            // You can add custom IR command handling here
+            // For example, map IR codes to volume control, etc.
+        });
+        
+        // Start the IR receiver
+        ir_receiver_->Start();
+        ESP_LOGI(TAG, "IR receiver initialized and started");
+    }
+
 public:
     XINGZHI_CUBE_1_54TFT_WIFI() :
         boot_button_(BOOT_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
-        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
+        ir_receiver_(nullptr) {
+        ESP_LOGI(TAG, "=== XINGZHI_CUBE_1_54TFT_WIFI constructor started ===");
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();
+        ESP_LOGI(TAG, "About to initialize IR receiver...");
+        InitializeIrReceiver();  // Initialize IR receiver BEFORE tools so it's available
+        ESP_LOGI(TAG, "About to initialize tools...");
+        InitializeTools();
+        ESP_LOGI(TAG, "Tools initialization completed");
         GetBacklight()->RestoreBrightness();
+        ESP_LOGI(TAG, "=== XINGZHI_CUBE_1_54TFT_WIFI constructor completed ===");
+    }
+
+    ~XINGZHI_CUBE_1_54TFT_WIFI() {
+        // Clean up IR receiver
+        if (ir_receiver_ != nullptr) {
+            delete ir_receiver_;
+            ir_receiver_ = nullptr;
+        }
+        
+        // Clean up other resources
+        if (power_save_timer_ != nullptr) {
+            delete power_save_timer_;
+            power_save_timer_ = nullptr;
+        }
+        
+        if (power_manager_ != nullptr) {
+            delete power_manager_;
+            power_manager_ = nullptr;
+        }
+        
+        if (display_ != nullptr) {
+            delete display_;
+            display_ = nullptr;
+        }
     }
 
     virtual AudioCodec* GetAudioCodec() override {

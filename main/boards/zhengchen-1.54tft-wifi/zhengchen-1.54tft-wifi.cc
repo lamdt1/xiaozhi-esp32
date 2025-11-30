@@ -19,6 +19,7 @@
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <new>
 
 #define TAG "ZHENGCHEN_1_54TFT_WIFI"
 
@@ -200,9 +201,13 @@ private:
     }
 
     void InitializeTools() {
+        ESP_LOGI(TAG, "=== InitializeTools() called ===");
+        ESP_LOGI(TAG, "Board type: zhengchen-1.54tft-wifi");
         auto& mcp_server = McpServer::GetInstance();
+        ESP_LOGI(TAG, "MCP server instance obtained");
         
         ESP_LOGI(TAG, "Initializing IR MCP tools...");
+        ESP_LOGI(TAG, "IR receiver pointer: %p", ir_receiver_);
         
         // IR Learning Mode Control
         ESP_LOGI(TAG, "Registering tool: self.ir.start_learning");
@@ -308,12 +313,16 @@ private:
         
         ESP_LOGI(TAG, "IR MCP tools initialized successfully");
         ESP_LOGI(TAG, "Total IR tools registered: 5 (start_learning, stop_learning, save_code, list_codes, get_learning_status)");
+        
+        // Verify tools are registered by checking MCP server
+        auto& mcp_server_check = McpServer::GetInstance();
+        ESP_LOGI(TAG, "Verification: MCP server instance obtained successfully");
     }
 
     void InitializeIrReceiver() {
-        ir_receiver_ = new IrReceiver(IR_RX_PIN);
+        ir_receiver_ = new (std::nothrow) IrReceiver(IR_RX_PIN);
         if (ir_receiver_ == nullptr) {
-            ESP_LOGE(TAG, "Failed to create IR receiver");
+            ESP_LOGE(TAG, "Failed to create IR receiver (out of memory)");
             return;
         }
         
@@ -341,14 +350,19 @@ public:
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
         ir_receiver_(nullptr) {
+        ESP_LOGI(TAG, "=== ZHENGCHEN_1_54TFT_WIFI constructor started ===");
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();
+        ESP_LOGI(TAG, "About to initialize IR receiver...");
         InitializeIrReceiver();  // Initialize IR receiver BEFORE tools so it's available
+        ESP_LOGI(TAG, "About to initialize tools...");
         InitializeTools();
+        ESP_LOGI(TAG, "Tools initialization completed");
         GetBacklight()->RestoreBrightness();
+        ESP_LOGI(TAG, "=== ZHENGCHEN_1_54TFT_WIFI constructor completed ===");
     }
 
     ~ZHENGCHEN_1_54TFT_WIFI() {

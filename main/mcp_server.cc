@@ -303,13 +303,18 @@ void McpServer::AddUserOnlyTools() {
 }
 
 void McpServer::AddTool(McpTool* tool) {
+    if (tool == nullptr) {
+        ESP_LOGE(TAG, "Attempted to add null tool");
+        return;
+    }
+    
     // Prevent adding duplicate tools
     if (std::find_if(tools_.begin(), tools_.end(), [tool](const McpTool* t) { return t->name() == tool->name(); }) != tools_.end()) {
         ESP_LOGW(TAG, "Tool %s already added", tool->name().c_str());
         return;
     }
 
-    ESP_LOGI(TAG, "Add tool: %s%s", tool->name().c_str(), tool->user_only() ? " [user]" : "");
+    ESP_LOGI(TAG, "Add tool: %s%s (total tools now: %d)", tool->name().c_str(), tool->user_only() ? " [user]" : "", static_cast<int>(tools_.size() + 1));
     tools_.push_back(tool);
 }
 
@@ -399,6 +404,7 @@ void McpServer::ParseMessage(const cJSON* json) {
         message += "\"}}";
         ReplyResult(id_int, message);
     } else if (method_str == "tools/list") {
+        ESP_LOGI(TAG, "tools/list called, total tools: %d", static_cast<int>(tools_.size()));
         std::string cursor_str = "";
         bool list_user_only_tools = false;
         if (params != nullptr) {
@@ -455,12 +461,15 @@ void McpServer::ReplyError(int id, const std::string& message) {
 }
 
 void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_only_tools) {
+    ESP_LOGI(TAG, "GetToolsList: cursor=%s, list_user_only=%d, total_tools=%d", 
+             cursor.c_str(), list_user_only_tools, static_cast<int>(tools_.size()));
     const int max_payload_size = 8000;
     std::string json = "{\"tools\":[";
     
     bool found_cursor = cursor.empty();
     auto it = tools_.begin();
     std::string next_cursor = "";
+    int tools_added = 0;
     
     while (it != tools_.end()) {
         // 如果我们还没有找到起始位置，继续搜索
@@ -487,8 +496,11 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
         }
         
         json += tool_json;
+        tools_added++;
         ++it;
     }
+    
+    ESP_LOGI(TAG, "GetToolsList: added %d tools to response", tools_added);
     
     if (json.back() == ',') {
         json.pop_back();
@@ -503,14 +515,19 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
 
     if (next_cursor.empty()) {
         json += "]}";
+        ESP_LOGI(TAG, "GetToolsList: No pagination needed, all tools returned");
     } else {
         json += "],\"nextCursor\":\"" + next_cursor + "\"}";
+        ESP_LOGI(TAG, "GetToolsList: Pagination needed, nextCursor=%s", next_cursor.c_str());
     }
     
+    ESP_LOGI(TAG, "GetToolsList: Response size: %d bytes", static_cast<int>(json.length()));
     ReplyResult(id, json);
 }
 
 void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments) {
+    ESP_LOGI(TAG, "tools/call: tool_name=%s, total_tools=%d", tool_name.c_str(), static_cast<int>(tools_.size()));
+    
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 
                                      return tool->name() == tool_name; 
@@ -518,9 +535,15 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
     
     if (tool_iter == tools_.end()) {
         ESP_LOGE(TAG, "tools/call: Unknown tool: %s", tool_name.c_str());
+        ESP_LOGI(TAG, "Available tools:");
+        for (const auto& tool : tools_) {
+            ESP_LOGI(TAG, "  - %s%s", tool->name().c_str(), tool->user_only() ? " [user]" : "");
+        }
         ReplyError(id, "Unknown tool: " + tool_name);
         return;
     }
+    
+    ESP_LOGI(TAG, "tools/call: Found tool %s, calling...", tool_name.c_str());
 
     PropertyList arguments = (*tool_iter)->properties();
     try {
