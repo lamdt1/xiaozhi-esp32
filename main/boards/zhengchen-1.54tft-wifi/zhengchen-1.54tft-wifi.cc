@@ -65,6 +65,11 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
 
+    // Static helper to safely get board instance (avoids dangling pointer in callbacks)
+    static ZHENGCHEN_1_54TFT_WIFI* GetBoardInstance() {
+        return static_cast<ZHENGCHEN_1_54TFT_WIFI*>(&Board::GetInstance());
+    }
+
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_9);
         power_manager_->OnTemperatureChanged([this](float chip_temp) {
@@ -222,14 +227,19 @@ private:
             "After calling this tool, the device will automatically save any IR codes received. "
             "The user should point their remote at the device and press buttons to learn the commands.",
             PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr) {
+                    ESP_LOGE(TAG, "Board instance not available");
+                    return "{\"status\":\"error\",\"message\":\"Board not available\"}";
+                }
                 ESP_LOGI(TAG, "self.ir.start_learning tool called");
-                if (ir_receiver_ != nullptr) {
+                if (board->ir_receiver_ != nullptr) {
                     ESP_LOGI(TAG, "Enabling IR learning mode");
-                    ir_receiver_->SetLearningMode(true);
-                    ir_receiver_->SetLearningCallback([this](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
+                    board->ir_receiver_->SetLearningMode(true);
+                    board->ir_receiver_->SetLearningCallback([board](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
                         // Auto-save with default name
-                        ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
+                        board->ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
                         ESP_LOGI(TAG, "Learned IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
                     });
                     ESP_LOGI(TAG, "IR learning mode enabled successfully");
@@ -245,12 +255,13 @@ private:
             "When the user asks to stop learning IR commands, stop learning remote, dừng học lệnh hồng ngoại, "
             "or exit IR learning mode, you MUST call this tool.",
             PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                if (ir_receiver_ != nullptr) {
-                    ir_receiver_->SetLearningMode(false);
-                    return "{\"status\":\"learning_mode_disabled\",\"message\":\"IR learning mode stopped.\"}";
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
                 }
-                return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                board->ir_receiver_->SetLearningMode(false);
+                return "{\"status\":\"learning_mode_disabled\",\"message\":\"IR learning mode stopped.\"}";
             });
         
         ESP_LOGI(TAG, "Registering tool: self.ir.save_code");
@@ -262,8 +273,9 @@ private:
                 Property("value", kPropertyTypeString),  // Value as hex string
                 Property("bits", kPropertyTypeInt)
             }),
-            [this](const PropertyList& properties) -> ReturnValue {
-                if (ir_receiver_ == nullptr) {
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
                     return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
                 }
                 
@@ -280,7 +292,7 @@ private:
                     return "{\"status\":\"error\",\"message\":\"Invalid value format. Use hex string (e.g., 0xFF00)\"}";
                 }
                 
-                ir_receiver_->SaveLearnedCode(name, static_cast<decode_type_t>(protocol), value, bits);
+                board->ir_receiver_->SaveLearnedCode(name, static_cast<decode_type_t>(protocol), value, bits);
                 // Escape name to prevent JSON injection
                 std::string escaped_name = EscapeJsonString(name);
                 return "{\"status\":\"success\",\"message\":\"IR code saved: " + escaped_name + "\"}";
@@ -292,9 +304,10 @@ private:
             "When the user asks to see learned IR codes, list remote commands, xem danh sách lệnh hồng ngoại, "
             "or show learned codes, you MUST call this tool.",
             PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                if (ir_receiver_ != nullptr) {
-                    return ir_receiver_->GetLearnedCodes();
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board != nullptr && board->ir_receiver_ != nullptr) {
+                    return board->ir_receiver_->GetLearnedCodes();
                 }
                 return "{\"codes\":[]}";
             });
@@ -303,9 +316,10 @@ private:
         mcp_server.AddTool("self.ir.get_learning_status",
             "Get the current status of IR learning mode.",
             PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                if (ir_receiver_ != nullptr) {
-                    bool learning = ir_receiver_->IsLearningMode();
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board != nullptr && board->ir_receiver_ != nullptr) {
+                    bool learning = board->ir_receiver_->IsLearningMode();
                     return learning ? "{\"learning_mode\":true}" : "{\"learning_mode\":false}";
                 }
                 return "{\"learning_mode\":false,\"error\":\"IR receiver not initialized\"}";
@@ -331,6 +345,7 @@ private:
             ESP_LOGI(TAG, "IR command received: protocol=%d, value=0x%llx", protocol, value);
             
             // Wake up from power save mode when IR command is received
+            // Note: This callback is set during initialization and board instance is valid
             if (power_save_timer_ != nullptr) {
                 power_save_timer_->WakeUp();
             }

@@ -310,7 +310,8 @@ void McpServer::AddTool(McpTool* tool) {
     
     // Prevent adding duplicate tools
     if (std::find_if(tools_.begin(), tools_.end(), [tool](const McpTool* t) { return t->name() == tool->name(); }) != tools_.end()) {
-        ESP_LOGW(TAG, "Tool %s already added", tool->name().c_str());
+        ESP_LOGW(TAG, "Tool %s already added, deleting duplicate", tool->name().c_str());
+        delete tool;  // Delete the duplicate tool to prevent memory leak
         return;
     }
 
@@ -319,10 +320,20 @@ void McpServer::AddTool(McpTool* tool) {
 }
 
 void McpServer::AddTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback) {
+    // Check for duplicates before creating the tool to avoid memory leak
+    if (std::find_if(tools_.begin(), tools_.end(), [&name](const McpTool* t) { return t->name() == name; }) != tools_.end()) {
+        ESP_LOGW(TAG, "Tool %s already added", name.c_str());
+        return;
+    }
     AddTool(new McpTool(name, description, properties, callback));
 }
 
 void McpServer::AddUserOnlyTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback) {
+    // Check for duplicates before creating the tool to avoid memory leak
+    if (std::find_if(tools_.begin(), tools_.end(), [&name](const McpTool* t) { return t->name() == name; }) != tools_.end()) {
+        ESP_LOGW(TAG, "Tool %s already added", name.c_str());
+        return;
+    }
     auto tool = new McpTool(name, description, properties, callback);
     tool->set_user_only(true);
     AddTool(tool);

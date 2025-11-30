@@ -135,9 +135,22 @@ void IrReceiver::SetLearningCallback(IrLearningCallback callback) {
 void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol, uint64_t value, uint16_t bits) {
     Settings settings("ir_codes", true);
     
+    // Validate name length to prevent truncation
+    // "code_" prefix is 5 chars, so max name length is 250 (255 - 5)
+    const size_t max_name_length = 250;
+    if (name.length() > max_name_length) {
+        ESP_LOGW(TAG, "IR code name too long (%zu chars), truncating to %zu chars: %s", 
+                 name.length(), max_name_length, name.c_str());
+    }
+    
     // Create a JSON-like string to store IR code info
-    char code_key[64];
-    snprintf(code_key, sizeof(code_key), "code_%s", name.c_str());
+    // Use larger buffer to prevent truncation (255 chars total: "code_" + name)
+    char code_key[256];
+    int written = snprintf(code_key, sizeof(code_key), "code_%s", name.c_str());
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(code_key)) {
+        ESP_LOGE(TAG, "Failed to create storage key for IR code name: %s", name.c_str());
+        return;
+    }
     
     char code_value[128];
     snprintf(code_value, sizeof(code_value), "{\"protocol\":%d,\"value\":%llu,\"bits\":%d}", 
@@ -199,8 +212,15 @@ std::string IrReceiver::GetLearnedCodes() const {
             code_list.substr(pos) : code_list.substr(pos, comma_pos - pos);
         
         if (!code_name.empty()) {
-            char code_key[64];
-            snprintf(code_key, sizeof(code_key), "code_%s", code_name.c_str());
+            // Use larger buffer to prevent truncation (255 chars total: "code_" + name)
+            char code_key[256];
+            int written = snprintf(code_key, sizeof(code_key), "code_%s", code_name.c_str());
+            if (written < 0 || static_cast<size_t>(written) >= sizeof(code_key)) {
+                ESP_LOGW(TAG, "IR code name too long, skipping: %s", code_name.c_str());
+                if (comma_pos == std::string::npos) break;
+                pos = comma_pos + 1;
+                continue;
+            }
             std::string code_value = settings.GetString(code_key, "");
             
             if (!code_value.empty()) {
