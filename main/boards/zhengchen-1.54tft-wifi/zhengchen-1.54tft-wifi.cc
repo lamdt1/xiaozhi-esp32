@@ -172,6 +172,8 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         
+        ESP_LOGI(TAG, "Initializing IR MCP tools...");
+        
         // IR Learning Mode Control
         mcp_server.AddTool("self.ir.start_learning", 
             "Start IR learning mode. When enabled, the device will save any IR codes received. "
@@ -251,6 +253,8 @@ private:
                 }
                 return "{\"learning_mode\":false,\"error\":\"IR receiver not initialized\"}";
             });
+        
+        ESP_LOGI(TAG, "IR MCP tools initialized successfully");
     }
 
     void InitializeIrReceiver() {
@@ -288,9 +292,9 @@ public:
         InitializePowerSaveTimer();
         InitializeSpi();
         InitializeButtons();
-        InitializeSt7789Display();  
+        InitializeSt7789Display();
+        InitializeIrReceiver();  // Initialize IR receiver BEFORE tools so it's available
         InitializeTools();
-        InitializeIrReceiver();
         GetBacklight()->RestoreBrightness();
     }
 
