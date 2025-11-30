@@ -37,6 +37,8 @@ public:
     bool IsLearningMode() const { return learning_mode_.load(); }
     void SetLearningCallback(IrLearningCallback callback);
     void SaveLearnedCode(const std::string& name, decode_type_t protocol, uint64_t value, uint16_t bits);
+    bool DeleteLearnedCode(const std::string& name);
+    void DeleteAllLearnedCodes();
     std::string GetLearnedCodes() const;
 
 private:

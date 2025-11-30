@@ -155,27 +155,53 @@ void IrReceiver::SetLearningCallback(IrLearningCallback callback) {
 }
 
 void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol, uint64_t value, uint16_t bits) {
-    ESP_LOGI(TAG, "SaveLearnedCode called: name=%s, protocol=%d, value=0x%llx, bits=%d", 
-             name.c_str(), protocol, value, bits);
+    // Safe logging - validate parameters first
+    const char* name_ptr = name.c_str();
+    if (name_ptr == nullptr) {
+        ESP_LOGE(TAG, "SaveLearnedCode called with null name pointer");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "SaveLearnedCode: name_len=%zu protocol=%d value=0x%llx bits=%u", 
+             name.length(), protocol, value, bits);
+    
     Settings settings("ir_codes", true);
     
-    // Validate and truncate name length to prevent silent truncation in snprintf
-    // "code_" prefix is 5 chars, so max name length is 250 (255 - 5)
-    const size_t max_name_length = 250;
+    // Validate and truncate name length to prevent NVS key too long error
+    // NVS key limit is 15 chars, "code_" prefix is 5 chars, so max name length is 10
+    // Note: We count bytes, not UTF-8 characters, to ensure NVS key limit
+    const size_t max_name_length = 10;
     std::string truncated_name = name;
     if (name.length() > max_name_length) {
-        ESP_LOGW(TAG, "IR code name too long (%zu chars), truncating to %zu chars: %s", 
-                 name.length(), max_name_length, name.c_str());
+        // Truncate by bytes (not UTF-8 chars) to ensure NVS key limit
         truncated_name = name.substr(0, max_name_length);
+        ESP_LOGW(TAG, "IR code name too long (%zu bytes), truncated to %zu bytes", 
+                 name.length(), truncated_name.length());
     }
     
     // Create a JSON-like string to store IR code info
-    // Use larger buffer to prevent truncation (255 chars total: "code_" + name)
-    char code_key[256];
+    // NVS key limit is 15 chars, so "code_" (5) + name (max 10) = 15 max
+    char code_key[16];  // 15 chars + null terminator
     int written = snprintf(code_key, sizeof(code_key), "code_%s", truncated_name.c_str());
     if (written < 0 || static_cast<size_t>(written) >= sizeof(code_key)) {
-        ESP_LOGE(TAG, "Failed to create storage key for IR code name: %s", truncated_name.c_str());
+        ESP_LOGE(TAG, "Failed to create storage key for IR code name: %s (key would be %d chars)", 
+                 truncated_name.c_str(), written);
         return;
+    }
+    
+    // Double-check key length (should never exceed 15, but safety check)
+    if (strlen(code_key) > 15) {
+        ESP_LOGE(TAG, "NVS key too long: %s (%zu chars), truncating name further", code_key, strlen(code_key));
+        // Truncate name to ensure key is exactly 15 chars
+        size_t max_name_for_key = 10;  // 15 - 5 ("code_")
+        if (truncated_name.length() > max_name_for_key) {
+            truncated_name = truncated_name.substr(0, max_name_for_key);
+            written = snprintf(code_key, sizeof(code_key), "code_%s", truncated_name.c_str());
+            if (written < 0 || static_cast<size_t>(written) >= sizeof(code_key)) {
+                ESP_LOGE(TAG, "Failed to create storage key even after truncation");
+                return;
+            }
+        }
     }
     
     char code_value[128];
@@ -220,8 +246,103 @@ void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol
         settings.SetString("code_list", code_list);
     }
     
-    ESP_LOGI(TAG, "Successfully saved IR code: %s (protocol=%d, value=0x%llx, bits=%d)", 
-             truncated_name.c_str(), protocol, value, bits);
+    ESP_LOGI(TAG, "Saved IR code: name_len=%zu protocol=%d value=0x%llx bits=%u", 
+             truncated_name.length(), protocol, value, bits);
+}
+
+bool IrReceiver::DeleteLearnedCode(const std::string& name) {
+    ESP_LOGI(TAG, "DeleteLearnedCode called: name_len=%zu", name.length());
+    Settings settings("ir_codes", true);
+    
+    // Validate and truncate name length (same as SaveLearnedCode)
+    // NVS key limit is 15 chars, "code_" prefix is 5 chars, so max name length is 10
+    const size_t max_name_length = 10;
+    std::string truncated_name = name;
+    if (name.length() > max_name_length) {
+        truncated_name = name.substr(0, max_name_length);
+        ESP_LOGW(TAG, "IR code name too long (%zu bytes), truncating to %zu bytes for deletion", 
+                 name.length(), truncated_name.length());
+    }
+    
+    // Create the storage key
+    char code_key[16];  // 15 chars + null terminator
+    int written = snprintf(code_key, sizeof(code_key), "code_%s", truncated_name.c_str());
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(code_key)) {
+        ESP_LOGE(TAG, "Failed to create storage key for IR code name: name_len=%zu", truncated_name.length());
+        return false;
+    }
+    
+    // Check if the code exists before trying to delete
+    std::string code_value = settings.GetString(code_key, "");
+    if (code_value.empty()) {
+        ESP_LOGW(TAG, "IR code not found: name_len=%zu", truncated_name.length());
+        return false;
+    }
+    
+    // Erase the code data
+    settings.EraseKey(code_key);
+    ESP_LOGI(TAG, "Erased IR code data: key=%s", code_key);
+    
+    // Remove from code_list
+    std::string code_list = settings.GetString("code_list", "");
+    if (!code_list.empty()) {
+        std::string new_code_list = "";
+        size_t pos = 0;
+        bool found = false;
+        
+        while (pos < code_list.length()) {
+            size_t comma_pos = code_list.find(',', pos);
+            std::string code_name = (comma_pos == std::string::npos) ? 
+                code_list.substr(pos) : code_list.substr(pos, comma_pos - pos);
+            
+            // Truncate code_name if needed for comparison
+            std::string truncated_code_name = code_name;
+            if (code_name.length() > max_name_length) {
+                truncated_code_name = code_name.substr(0, max_name_length);
+            }
+            
+            // Skip if this is the code we're deleting
+            if (truncated_code_name == truncated_name) {
+                found = true;
+                ESP_LOGI(TAG, "Removed '%s' from code_list", code_name.c_str());
+            } else if (!code_name.empty()) {
+                // Keep this code in the list
+                if (!new_code_list.empty()) {
+                    new_code_list += ",";
+                }
+                new_code_list += code_name;
+            }
+            
+            if (comma_pos == std::string::npos) break;
+            pos = comma_pos + 1;
+        }
+        
+        // Update code_list
+        if (found) {
+            if (new_code_list.empty()) {
+                // If list is now empty, erase the key
+                settings.EraseKey("code_list");
+                ESP_LOGI(TAG, "Code list is now empty, erased code_list key");
+            } else {
+                settings.SetString("code_list", new_code_list);
+                ESP_LOGI(TAG, "Updated code_list, remaining codes: %s", new_code_list.c_str());
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Successfully deleted IR code: name_len=%zu", truncated_name.length());
+    return true;
+}
+
+void IrReceiver::DeleteAllLearnedCodes() {
+    ESP_LOGI(TAG, "DeleteAllLearnedCodes called: deleting all learned IR codes");
+    Settings settings("ir_codes", true);
+    
+    // Erase all keys in the ir_codes namespace
+    // This will delete all code_* keys and code_list
+    settings.EraseAll();
+    
+    ESP_LOGI(TAG, "Successfully deleted all learned IR codes");
 }
 
 std::string IrReceiver::GetLearnedCodes() const {
@@ -341,9 +462,10 @@ void IrReceiver::ProcessIrTask() {
                     if (callback_copy) {
                         ESP_LOGI(TAG, "Calling learning callback with protocol=%d, value=0x%llx", 
                                  results.decode_type, results.value);
-                        // Generate a default name if needed
-                        char default_name[32];
-                        snprintf(default_name, sizeof(default_name), "IR_%llx", results.value);
+                        // Generate a default name if needed (max 10 chars for NVS key limit)
+                        // Use last 6 hex digits of value to keep name short
+                        char default_name[11];  // 10 chars + null terminator
+                        snprintf(default_name, sizeof(default_name), "IR_%06llx", results.value & 0xFFFFFF);
                         std::string name_str(default_name);
                         callback_copy(results.decode_type, results.value, results.bits, name_str);
                         ESP_LOGI(TAG, "Learning callback completed");
@@ -369,8 +491,10 @@ void IrReceiver::ProcessIrTask() {
                     }
                     
                     if (callback_copy) {
-                        char default_name[32];
-                        snprintf(default_name, sizeof(default_name), "IR_UNKNOWN_%llx", results.value);
+                        // Generate short name (max 10 chars for NVS key limit)
+                        // Use last 4 hex digits of value to keep name short
+                        char default_name[11];  // 10 chars + null terminator
+                        snprintf(default_name, sizeof(default_name), "UNK_%04llx", results.value & 0xFFFF);
                         std::string name_str(default_name);
                         callback_copy(results.decode_type, results.value, results.bits, name_str);
                         ESP_LOGI(TAG, "UNKNOWN protocol code saved via learning callback");

@@ -232,7 +232,7 @@ private:
                         auto* board = GetBoardInstance();
                         if (board != nullptr && board->ir_receiver_ != nullptr) {
                             board->ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
-                            ESP_LOGI(TAG, "Learned IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
+                            ESP_LOGI(TAG, "Learned IR code: name=%s protocol=%d value=0x%llx", name.c_str(), protocol, value);
                         } else {
                             ESP_LOGW(TAG, "Board or IR receiver not available when saving learned code");
                         }
@@ -322,8 +322,53 @@ private:
                 return "{\"learning_mode\":false,\"error\":\"IR receiver not initialized\"}";
             });
         
+        ESP_LOGI(TAG, "Registering tool: self.ir.delete_code");
+        mcp_server.AddTool("self.ir.delete_code",
+            "Delete a learned IR (infrared) code by name. "
+            "When the user asks to delete an IR code, remove a learned code, xóa lệnh hồng ngoại, "
+            "or delete a remote command, you MUST call this tool.",
+            PropertyList({
+                Property("name", kPropertyTypeString)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                }
+                
+                auto name = properties["name"].value<std::string>();
+                if (name.empty()) {
+                    return "{\"status\":\"error\",\"message\":\"Code name cannot be empty\"}";
+                }
+                
+                bool deleted = board->ir_receiver_->DeleteLearnedCode(name);
+                if (deleted) {
+                    std::string escaped_name = EscapeJsonString(name);
+                    return "{\"status\":\"success\",\"message\":\"IR code deleted: " + escaped_name + "\"}";
+                } else {
+                    std::string escaped_name = EscapeJsonString(name);
+                    return "{\"status\":\"error\",\"message\":\"IR code not found: " + escaped_name + "\"}";
+                }
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.delete_all_codes");
+        mcp_server.AddTool("self.ir.delete_all_codes",
+            "Delete all learned IR (infrared) codes. "
+            "When the user asks to delete all IR codes, clear all learned codes, xóa hết lệnh hồng ngoại, "
+            "xóa tất cả lệnh đã học, reset IR codes, or start fresh, you MUST call this tool.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                }
+                
+                board->ir_receiver_->DeleteAllLearnedCodes();
+                return "{\"status\":\"success\",\"message\":\"All IR codes deleted. You can now learn new codes from scratch.\"}";
+            });
+        
         ESP_LOGI(TAG, "IR MCP tools initialized successfully");
-        ESP_LOGI(TAG, "Total IR tools registered: 5 (start_learning, stop_learning, save_code, list_codes, get_learning_status)");
+        ESP_LOGI(TAG, "Total IR tools registered: 7 (start_learning, stop_learning, save_code, list_codes, get_learning_status, delete_code, delete_all_codes)");
     }
 
     void InitializeIrReceiver() {
