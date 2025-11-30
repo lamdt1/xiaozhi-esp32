@@ -35,5 +35,8 @@
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_20
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 
+// IR Remote Control
+#define IR_RX_PIN GPIO_NUM_12
+#define IR_TX_PIN GPIO_NUM_11
 
 #endif // _BOARD_CONFIG_H_
