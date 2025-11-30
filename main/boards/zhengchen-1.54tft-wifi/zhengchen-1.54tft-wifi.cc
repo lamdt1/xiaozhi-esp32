@@ -208,23 +208,29 @@ private:
         ESP_LOGI(TAG, "Registering tool: self.ir.start_learning");
         mcp_server.AddTool("self.ir.start_learning", 
             "Start IR (infrared) learning mode to learn remote control commands.\n"
-            "Use this tool when the user asks to:\n"
-            "1. Learn IR commands, learn remote controls, learn hồng ngoại\n"
-            "2. Học lệnh hồng ngoại, học lệnh remote, vào chế độ học lệnh hồng ngoại\n"
-            "3. Start IR learning mode, begin learning remote commands\n"
+            "You MUST call this tool immediately when the user asks to:\n"
+            "- Learn IR commands / learn remote controls / learn hồng ngoại\n"
+            "- Học lệnh hồng ngoại / học lệnh remote / vào chế độ học lệnh hồng ngoại\n"
+            "- Bắt đầu học lệnh hồng ngoại / bắt đầu học remote\n"
+            "- Start IR learning / begin learning remote commands\n"
+            "- Any request related to learning or teaching IR/remote commands\n"
             "After calling this tool, the device will automatically save any IR codes received. "
             "The user should point their remote at the device and press buttons to learn the commands.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
+                ESP_LOGI(TAG, "self.ir.start_learning tool called");
                 if (ir_receiver_ != nullptr) {
+                    ESP_LOGI(TAG, "Enabling IR learning mode");
                     ir_receiver_->SetLearningMode(true);
                     ir_receiver_->SetLearningCallback([this](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
                         // Auto-save with default name
                         ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
                         ESP_LOGI(TAG, "Learned IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
                     });
+                    ESP_LOGI(TAG, "IR learning mode enabled successfully");
                     return "{\"status\":\"learning_mode_enabled\",\"message\":\"IR learning mode started. Point your remote at the device and press buttons.\"}";
                 }
+                ESP_LOGE(TAG, "IR receiver is null, cannot enable learning mode");
                 return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
             });
         
@@ -301,6 +307,7 @@ private:
             });
         
         ESP_LOGI(TAG, "IR MCP tools initialized successfully");
+        ESP_LOGI(TAG, "Total IR tools registered: 5 (start_learning, stop_learning, save_code, list_codes, get_learning_status)");
     }
 
     void InitializeIrReceiver() {
