@@ -9,7 +9,6 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
-#include "ir_receiver.h"
 #include "mcp_server.h"
 #include "settings.h"
 
@@ -20,6 +19,12 @@
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include <new>
+
+// Forward declaration to avoid IPADDR_NONE conflict between lwip and Arduino headers
+class IrReceiver;
+
+// Include ir_receiver.h after all system headers to avoid IPADDR_NONE conflict with lwip
+#include "ir_receiver.h"
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
 
@@ -39,7 +44,7 @@ static std::string EscapeJsonString(const std::string& str) {
             case '\t': escaped += "\\t"; break;
             default:
                 // Escape control characters (0x00-0x1F)
-                if (c >= 0 && c < 0x20) {
+                if (static_cast<unsigned char>(c) < 0x20) {
                     char hex[7];
                     snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
                     escaped += hex;
@@ -220,13 +225,20 @@ private:
                 }
                 ESP_LOGI(TAG, "self.ir.start_learning tool called");
                 if (board->ir_receiver_ != nullptr) {
-                    ESP_LOGI(TAG, "Enabling IR learning mode");
-                    board->ir_receiver_->SetLearningMode(true);
-                    board->ir_receiver_->SetLearningCallback([board](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
+                    ESP_LOGI(TAG, "Setting up IR learning mode");
+                    // Set callback BEFORE enabling learning mode to prevent race condition
+                    board->ir_receiver_->SetLearningCallback([](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
                         // Auto-save with default name
-                        board->ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
-                        ESP_LOGI(TAG, "Learned IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
+                        auto* board = GetBoardInstance();
+                        if (board != nullptr && board->ir_receiver_ != nullptr) {
+                            board->ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
+                            ESP_LOGI(TAG, "Learned IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
+                        } else {
+                            ESP_LOGW(TAG, "Board or IR receiver not available when saving learned code");
+                        }
                     });
+                    // Enable learning mode AFTER callback is set
+                    board->ir_receiver_->SetLearningMode(true);
                     ESP_LOGI(TAG, "IR learning mode enabled successfully");
                     return "{\"status\":\"learning_mode_enabled\",\"message\":\"IR learning mode started. Point your remote at the device and press buttons.\"}";
                 }
@@ -254,9 +266,9 @@ private:
             "Save a learned IR code with a custom name. Use this after learning an IR code to give it a meaningful name.",
             PropertyList({
                 Property("name", kPropertyTypeString),
-                Property("protocol", kPropertyTypeInt),
+                Property("protocol", kPropertyTypeInteger),
                 Property("value", kPropertyTypeString),  // Value as hex string
-                Property("bits", kPropertyTypeInt)
+                Property("bits", kPropertyTypeInteger)
             }),
             [](const PropertyList& properties) -> ReturnValue {
                 auto* board = GetBoardInstance();
@@ -344,6 +356,9 @@ public:
         boot_button_(BOOT_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
+        display_(nullptr),
+        power_save_timer_(nullptr),
+        power_manager_(nullptr),
         ir_receiver_(nullptr) {
         ESP_LOGI(TAG, "=== XINGZHI_CUBE_1_54TFT_WIFI constructor started ===");
         InitializePowerManager();

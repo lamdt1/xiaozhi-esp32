@@ -23,7 +23,7 @@ static std::string EscapeJsonString(const std::string& str) {
             case '\t': escaped += "\\t"; break;
             default:
                 // Escape control characters (0x00-0x1F)
-                if (c >= 0 && c < 0x20) {
+                if (static_cast<unsigned char>(c) < 0x20) {
                     char hex[7];
                     snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned char>(c));
                     escaped += hex;
@@ -104,16 +104,31 @@ void IrReceiver::Stop() {
     
     running_.store(false);
     
-    // Wait for task to finish (with timeout)
-    if (task_handle_ != nullptr) {
-        // Give task time to exit
-        vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // Delete task if still running
-        if (eTaskGetState(task_handle_) != eDeleted) {
-            vTaskDelete(task_handle_);
+    // Wait for task to finish and delete itself
+    // The task will delete itself using vTaskDelete(NULL) after ProcessIrTask() returns
+    // We just wait for it to complete - do not try to delete it from here
+    TaskHandle_t handle_to_wait = nullptr;
+    taskENTER_CRITICAL();
+    handle_to_wait = task_handle_;
+    taskEXIT_CRITICAL();
+    
+    if (handle_to_wait != nullptr) {
+        // Wait for task to exit its loop and delete itself
+        // Give it reasonable time to finish (max 1 second)
+        for (int i = 0; i < 10; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            taskENTER_CRITICAL();
+            bool still_exists = (task_handle_ != nullptr);
+            taskEXIT_CRITICAL();
+            if (!still_exists) {
+                break; // Task has deleted itself
+            }
         }
+        
+        // Clear handle if task hasn't deleted itself yet (shouldn't happen normally)
+        taskENTER_CRITICAL();
         task_handle_ = nullptr;
+        taskEXIT_CRITICAL();
     }
     
     ESP_LOGI(TAG, "IR receiver task stopped");
@@ -129,26 +144,29 @@ void IrReceiver::SetLearningMode(bool enabled) {
 }
 
 void IrReceiver::SetLearningCallback(IrLearningCallback callback) {
+    std::lock_guard<std::mutex> lock(learning_callback_mutex_);
     learning_callback_ = callback;
 }
 
 void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol, uint64_t value, uint16_t bits) {
     Settings settings("ir_codes", true);
     
-    // Validate name length to prevent truncation
+    // Validate and truncate name length to prevent silent truncation in snprintf
     // "code_" prefix is 5 chars, so max name length is 250 (255 - 5)
     const size_t max_name_length = 250;
+    std::string truncated_name = name;
     if (name.length() > max_name_length) {
         ESP_LOGW(TAG, "IR code name too long (%zu chars), truncating to %zu chars: %s", 
                  name.length(), max_name_length, name.c_str());
+        truncated_name = name.substr(0, max_name_length);
     }
     
     // Create a JSON-like string to store IR code info
     // Use larger buffer to prevent truncation (255 chars total: "code_" + name)
     char code_key[256];
-    int written = snprintf(code_key, sizeof(code_key), "code_%s", name.c_str());
+    int written = snprintf(code_key, sizeof(code_key), "code_%s", truncated_name.c_str());
     if (written < 0 || static_cast<size_t>(written) >= sizeof(code_key)) {
-        ESP_LOGE(TAG, "Failed to create storage key for IR code name: %s", name.c_str());
+        ESP_LOGE(TAG, "Failed to create storage key for IR code name: %s", truncated_name.c_str());
         return;
     }
     
@@ -170,8 +188,12 @@ void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol
             std::string code_name = (comma_pos == std::string::npos) ? 
                 code_list.substr(pos) : code_list.substr(pos, comma_pos - pos);
             
-            // Exact match check
-            if (code_name == name) {
+            // Exact match check (use truncated name if original was truncated)
+            std::string truncated_code_name = code_name;
+            if (code_name.length() > max_name_length) {
+                truncated_code_name = code_name.substr(0, max_name_length);
+            }
+            if (truncated_code_name == truncated_name) {
                 name_exists = true;
                 break;
             }
@@ -181,16 +203,16 @@ void IrReceiver::SaveLearnedCode(const std::string& name, decode_type_t protocol
         }
     }
     
-    // Only add if name doesn't exist
+    // Only add if name doesn't exist (use truncated name to match storage key)
     if (!name_exists) {
         if (!code_list.empty()) {
             code_list += ",";
         }
-        code_list += name;
+        code_list += truncated_name;
         settings.SetString("code_list", code_list);
     }
     
-    ESP_LOGI(TAG, "Saved IR code: %s (protocol=%d, value=0x%llx)", name.c_str(), protocol, value);
+    ESP_LOGI(TAG, "Saved IR code: %s (protocol=%d, value=0x%llx)", truncated_name.c_str(), protocol, value);
 }
 
 std::string IrReceiver::GetLearnedCodes() const {
@@ -249,6 +271,15 @@ void IrReceiver::IrTask(void* arg) {
     }
     
     receiver->ProcessIrTask();
+    
+    // Clear task handle before deleting self to prevent Stop() from accessing invalid handle
+    // Use critical section to ensure atomic operation
+    taskENTER_CRITICAL();
+    receiver->task_handle_ = nullptr;
+    taskEXIT_CRITICAL();
+    
+    // Task deletes itself - this is the safe pattern in FreeRTOS
+    // vTaskDelete(NULL) deletes the calling task
     vTaskDelete(NULL);
 }
 
@@ -285,11 +316,20 @@ void IrReceiver::ProcessIrTask() {
                 
                 // If in learning mode, trigger learning callback
                 bool is_learning = learning_mode_.load();
-                if (is_learning && learning_callback_) {
-                    // Generate a default name if needed
-                    char default_name[32];
-                    snprintf(default_name, sizeof(default_name), "IR_%llx", results.value);
-                    learning_callback_(results.decode_type, results.value, results.bits, default_name);
+                if (is_learning) {
+                    // Safely copy callback under mutex protection
+                    IrLearningCallback callback_copy;
+                    {
+                        std::lock_guard<std::mutex> lock(learning_callback_mutex_);
+                        callback_copy = learning_callback_;
+                    }
+                    
+                    if (callback_copy) {
+                        // Generate a default name if needed
+                        char default_name[32];
+                        snprintf(default_name, sizeof(default_name), "IR_%llx", results.value);
+                        callback_copy(results.decode_type, results.value, results.bits, default_name);
+                    }
                 }
                 
                 // Call normal callback if set (and not in learning mode)

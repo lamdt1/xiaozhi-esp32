@@ -1,6 +1,12 @@
 #ifndef IR_RECEIVER_H_
 #define IR_RECEIVER_H_
 
+// Undefine INADDR_NONE macro from lwip to avoid conflict with Arduino's IPAddress.h
+// This macro is defined by lwip but Arduino's IPAddress.h tries to use it as a variable name
+#ifdef INADDR_NONE
+#undef INADDR_NONE
+#endif
+
 #include "Arduino.h"
 #include <IRrecv.h>
 #include <IRremoteESP8266.h>
@@ -11,6 +17,7 @@
 #include <esp_log.h>
 #include <functional>
 #include <atomic>
+#include <mutex>
 
 class IrReceiver {
 public:
@@ -40,6 +47,7 @@ private:
     TaskHandle_t task_handle_;
     IrCallback callback_;
     IrLearningCallback learning_callback_;
+    std::mutex learning_callback_mutex_;  // Protects learning_callback_ access
     std::atomic<bool> running_;
     std::atomic<bool> learning_mode_;
 };
