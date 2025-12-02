@@ -205,94 +205,74 @@ private:
         ESP_LOGI(TAG, "IR receiver pointer: %p", ir_receiver_);
         
         // IR Learning Mode Control
-        ESP_LOGI(TAG, "Registering tool: self.ir.start_learning");
-        mcp_server.AddTool("self.ir.start_learning", 
-            "Start IR (infrared) learning mode to learn remote control commands.\n"
-            "You MUST call this tool immediately when the user asks to:\n"
-            "- Learn IR commands / learn remote controls / learn hồng ngoại\n"
-            "- Học lệnh hồng ngoại / học lệnh remote / vào chế độ học lệnh hồng ngoại\n"
-            "- Bắt đầu học lệnh hồng ngoại / bắt đầu học remote\n"
-            "- Start IR learning / begin learning remote commands\n"
-            "- Any request related to learning or teaching IR/remote commands\n"
-            "After calling this tool, the device will automatically save any IR codes received. "
-            "The user should point their remote at the device and press buttons to learn the commands.",
-            PropertyList(),
-            [](const PropertyList& properties) -> ReturnValue {
-                auto* board = GetBoardInstance();
-                if (board == nullptr) {
-                    ESP_LOGE(TAG, "Board instance not available");
-                    return "{\"status\":\"error\",\"message\":\"Board not available\"}";
-                }
-                ESP_LOGI(TAG, "self.ir.start_learning tool called");
-                if (board->ir_receiver_ != nullptr) {
-                    ESP_LOGI(TAG, "Setting up IR learning mode");
-                    // Set callback BEFORE enabling learning mode to prevent race condition
-                    board->ir_receiver_->SetLearningCallback([](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& name) {
-                        // Auto-save with default name
-                        auto* board = GetBoardInstance();
-                        if (board != nullptr && board->ir_receiver_ != nullptr) {
-                            board->ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
-                            ESP_LOGI(TAG, "Learned IR code: name=%s protocol=%d value=0x%llx", name.c_str(), protocol, value);
-                        } else {
-                            ESP_LOGW(TAG, "Board or IR receiver not available when saving learned code");
-                        }
-                    });
-                    // Enable learning mode AFTER callback is set
-                    board->ir_receiver_->SetLearningMode(true);
-                    ESP_LOGI(TAG, "IR learning mode enabled successfully");
-                    return "{\"status\":\"learning_mode_enabled\",\"message\":\"IR learning mode started. Point your remote at the device and press buttons.\"}";
-                }
-                ESP_LOGE(TAG, "IR receiver is null, cannot enable learning mode");
-                return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
-            });
-        
-        ESP_LOGI(TAG, "Registering tool: self.ir.stop_learning");
-        mcp_server.AddTool("self.ir.stop_learning",
-            "Stop IR (infrared) learning mode. "
-            "When the user asks to stop learning IR commands, stop learning remote, dừng học lệnh hồng ngoại, "
-            "or exit IR learning mode, you MUST call this tool.",
-            PropertyList(),
-            [](const PropertyList& properties) -> ReturnValue {
-                auto* board = GetBoardInstance();
-                if (board == nullptr || board->ir_receiver_ == nullptr) {
-                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
-                }
-                board->ir_receiver_->SetLearningMode(false);
-                return "{\"status\":\"learning_mode_disabled\",\"message\":\"IR learning mode stopped.\"}";
-            });
-        
-        ESP_LOGI(TAG, "Registering tool: self.ir.save_code");
-        mcp_server.AddTool("self.ir.save_code",
-            "Save a learned IR code with a custom name. Use this after learning an IR code to give it a meaningful name.",
+        ESP_LOGI(TAG, "Registering tool: self.ir.learn_code");
+        mcp_server.AddTool("self.ir.learn_code", 
+            "Learn a single IR (infrared) code and save it with a specific name. (Học một lệnh hồng ngoại và lưu với tên cụ thể).\n"
+            "Use this when the user wants to learn or save a new remote command with a name like 'TV on' or 'Fan speed up'.\n"
+            "You MUST provide a 'name' for the command.\n"
+            "Example: self.ir.learn_code(name=\"tv_power\")",
             PropertyList({
-                Property("name", kPropertyTypeString),
-                Property("protocol", kPropertyTypeInteger),
-                Property("value", kPropertyTypeString),  // Value as hex string
-                Property("bits", kPropertyTypeInteger)
+                Property("name", kPropertyTypeString)
             }),
             [](const PropertyList& properties) -> ReturnValue {
                 auto* board = GetBoardInstance();
                 if (board == nullptr || board->ir_receiver_ == nullptr) {
                     return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
                 }
-                
+
                 auto name = properties["name"].value<std::string>();
-                int protocol = properties["protocol"].value<int>();
-                auto value_str = properties["value"].value<std::string>();
-                int bits = properties["bits"].value<int>();
-                
-                // Convert hex string to uint64_t
-                uint64_t value = 0;
-                try {
-                    value = std::stoull(value_str, nullptr, 16);
-                } catch (...) {
-                    return "{\"status\":\"error\",\"message\":\"Invalid value format. Use hex string (e.g., 0xFF00)\"}";
+                if (name.empty()) {
+                    return "{\"status\":\"error\",\"message\":\"Command name cannot be empty\"}";
                 }
+                // NVS Key length is 15 chars, "code_" prefix is 5, so name is max 10.
+                if (name.length() > 10) {
+                    return "{\"status\":\"error\",\"message\":\"Name is too long (max 10 characters)\"}";
+                }
+
+                ESP_LOGI(TAG, "Starting one-shot learn for command: %s", name.c_str());
+
+                // Check if learning mode is already active
+                if (board->ir_receiver_->IsLearningMode()) {
+                    ESP_LOGW(TAG, "Learning mode already active, will replace existing callback");
+                }
+
+                // Set a one-shot learning callback for protocol-based codes
+                board->ir_receiver_->SetLearningCallback([name](decode_type_t protocol, uint64_t value, uint16_t bits, const std::string& default_name) {
+                    auto* board_cb = GetBoardInstance();
+                    if (board_cb != nullptr && board_cb->ir_receiver_ != nullptr) {
+                        // Save the code with the user-provided name
+                        board_cb->ir_receiver_->SaveLearnedCode(name, protocol, value, bits);
+                        ESP_LOGI(TAG, "Learned and saved IR code '%s'", name.c_str());
+                        
+                        // Immediately disable learning mode after capture
+                        board_cb->ir_receiver_->SetLearningMode(false);
+                        // Clear the callback so it doesn't fire again
+                        board_cb->ir_receiver_->SetLearningCallback(nullptr);
+                        board_cb->ir_receiver_->SetRawLearningCallback(nullptr);
+                    }
+                });
                 
-                board->ir_receiver_->SaveLearnedCode(name, static_cast<decode_type_t>(protocol), value, bits);
-                // Escape name to prevent JSON injection
+                // Also set raw learning callback to save raw data (works even for invalid protocols)
+                board->ir_receiver_->SetRawLearningCallback([name](const uint16_t* raw_data, uint16_t raw_len, const std::string& default_name) {
+                    auto* board_cb = GetBoardInstance();
+                    if (board_cb != nullptr && board_cb->ir_receiver_ != nullptr) {
+                        // Save raw data with the user-provided name
+                        board_cb->ir_receiver_->SaveRawCode(name, raw_data, raw_len);
+                        ESP_LOGI(TAG, "Learned and saved raw IR code '%s' (raw_len=%u)", name.c_str(), raw_len);
+                        
+                        // Disable learning mode after saving raw data (one-shot)
+                        board_cb->ir_receiver_->SetLearningMode(false);
+                        // Clear callbacks so they don't fire again
+                        board_cb->ir_receiver_->SetLearningCallback(nullptr);
+                        board_cb->ir_receiver_->SetRawLearningCallback(nullptr);
+                    }
+                });
+
+                // Enable learning mode to capture the next code
+                board->ir_receiver_->SetLearningMode(true);
+                
                 std::string escaped_name = EscapeJsonString(name);
-                return "{\"status\":\"success\",\"message\":\"IR code saved: " + escaped_name + "\"}";
+                return "{\"status\":\"learning\",\"message\":\"Ready to learn code for '" + escaped_name + "'. Press a button on your remote now.\"}";
             });
         
         ESP_LOGI(TAG, "Registering tool: self.ir.list_codes");
@@ -367,12 +347,89 @@ private:
                 return "{\"status\":\"success\",\"message\":\"All IR codes deleted. You can now learn new codes from scratch.\"}";
             });
         
+        ESP_LOGI(TAG, "Registering tool: self.ir.send_code");
+        mcp_server.AddTool("self.ir.send_code",
+            "Send/transmit a learned IR (infrared) code by name. "
+            "When the user wants to send an IR command, transmit an IR code, gửi lệnh hồng ngoại, "
+            "or control a device via IR, you MUST call this tool. "
+            "This will try to send as protocol-based code first, then try raw data if available.",
+            PropertyList({
+                Property("name", kPropertyTypeString)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                }
+                
+                auto name = properties["name"].value<std::string>();
+                if (name.empty()) {
+                    return "{\"status\":\"error\",\"message\":\"Code name cannot be empty\"}";
+                }
+                
+                // SendLearnedCode now automatically tries raw data as fallback
+                bool sent = board->ir_receiver_->SendLearnedCode(name);
+                
+                if (sent) {
+                    std::string escaped_name = EscapeJsonString(name);
+                    return "{\"status\":\"success\",\"message\":\"IR code sent: " + escaped_name + "\"}";
+                } else {
+                    std::string escaped_name = EscapeJsonString(name);
+                    return "{\"status\":\"error\",\"message\":\"Failed to send IR code: " + escaped_name + "\"}";
+                }
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.send_raw_code");
+        mcp_server.AddTool("self.ir.send_raw_code",
+            "Send/transmit a learned raw IR (infrared) code by name. "
+            "Use this when you want to send raw IR data that was saved (works for any protocol, even invalid ones).",
+            PropertyList({
+                Property("name", kPropertyTypeString)
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                }
+                
+                auto name = properties["name"].value<std::string>();
+                if (name.empty()) {
+                    return "{\"status\":\"error\",\"message\":\"Code name cannot be empty\"}";
+                }
+                
+                bool sent = board->ir_receiver_->SendLearnedRawCode(name);
+                if (sent) {
+                    std::string escaped_name = EscapeJsonString(name);
+                    return "{\"status\":\"success\",\"message\":\"Raw IR code sent: " + escaped_name + "\"}";
+                } else {
+                    std::string escaped_name = EscapeJsonString(name);
+                    return "{\"status\":\"error\",\"message\":\"Failed to send raw IR code: " + escaped_name + "\"}";
+                }
+            });
+        
+        ESP_LOGI(TAG, "Registering tool: self.ir.export_constants");
+        mcp_server.AddTool("self.ir.export_constants",
+            "Export all learned IR codes as C++ constants that can be used in code. "
+            "When the user wants to export IR codes as constants, generate C++ code, "
+            "or create header file with IR commands, you MUST call this tool.",
+            PropertyList(),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto* board = GetBoardInstance();
+                if (board == nullptr || board->ir_receiver_ == nullptr) {
+                    return "{\"status\":\"error\",\"message\":\"IR receiver not initialized\"}";
+                }
+                
+                std::string constants = board->ir_receiver_->ExportAsConstants();
+                std::string escaped = EscapeJsonString(constants);
+                return "{\"status\":\"success\",\"constants\":\"" + escaped + "\"}";
+            });
+        
         ESP_LOGI(TAG, "IR MCP tools initialized successfully");
-        ESP_LOGI(TAG, "Total IR tools registered: 7 (start_learning, stop_learning, save_code, list_codes, get_learning_status, delete_code, delete_all_codes)");
+        ESP_LOGI(TAG, "Total IR tools registered: 8 (learn_code, list_codes, get_learning_status, delete_code, delete_all_codes, send_code, send_raw_code, export_constants)");
     }
 
     void InitializeIrReceiver() {
-        ir_receiver_ = new (std::nothrow) IrReceiver(IR_RX_PIN);
+        ir_receiver_ = new (std::nothrow) IrReceiver(IR_RX_PIN, IR_TX_PIN);
         if (ir_receiver_ == nullptr) {
             ESP_LOGE(TAG, "Failed to create IR receiver (out of memory)");
             return;
